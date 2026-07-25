@@ -16,7 +16,7 @@ on:
 
 jobs:
   deploy:
-    if: github.repository_owner == 'newbietan'
+    if: github.repository_owner == 'kissesch'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
