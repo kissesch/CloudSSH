@@ -1,8 +1,10 @@
-import { loadKnownFingerprint } from './terminal';
+import { loadKnownFingerprint } from './known-hosts';
 import type { TabManager } from './tab-manager';
 import { populateRegionSelect, regionLabel } from './regions';
 import { notify } from './ui-feedback';
 import { onLocaleChange, t, translateDocument } from './i18n';
+import { parsePort } from './port';
+import { getActiveColorScheme, onColorSchemeChange, type ColorScheme } from './theme';
 // --- Credential encryption helpers ---
 async function deriveKey(salt: Uint8Array): Promise<CryptoKey> {
   const raw = new TextEncoder().encode(window.location.origin + ':cloudssh');
@@ -56,10 +58,21 @@ export class ConnectionForm {
   private turnstileVerified = false;
   private turnstileWidgetId: string | null = null;
   private turnstileSitekey = '';
+  private turnstileTheme: ColorScheme | null = null;
 
   constructor(options: ConnectionFormOptions) {
     this.options = options;
     this.render();
+    onColorSchemeChange((colorScheme) => {
+      if (
+        this.turnstileEnabled
+        && this.turnstileSitekey
+        && !this.turnstileVerified
+        && this.turnstileTheme !== colorScheme
+      ) {
+        this.renderTurnstile();
+      }
+    });
     this.loadSavedCredentials();
     this.checkTurnstileConfig();
     onLocaleChange(() => {
@@ -76,9 +89,14 @@ export class ConnectionForm {
         turnstileEnabled: boolean;
         sitekey: string;
         githubAuthEnabled: boolean;
+        githubAuthRequired: boolean;
       };
       this.turnstileEnabled = config.turnstileEnabled;
       this.turnstileSitekey = config.sitekey;
+      if (config.githubAuthRequired) {
+        this.renderGitHubAuthRequired(config.githubAuthEnabled);
+        return;
+      }
       if (this.turnstileEnabled && this.turnstileSitekey) {
         this.renderTurnstile();
       }
@@ -89,6 +107,26 @@ export class ConnectionForm {
     } catch {
       // Config endpoint not available, skip Turnstile
     }
+  }
+
+  private renderGitHubAuthRequired(githubAuthEnabled: boolean): void {
+    const container = document.getElementById('connection-form-container');
+    if (!container) return;
+
+    container.innerHTML = `
+      <div class="flex min-h-[320px] flex-col items-center justify-center gap-5 px-4 text-center" id="github-auth-required-panel">
+        <span class="material-symbols-outlined text-[var(--accent)]" style="font-size: 42px;" aria-hidden="true">lock</span>
+        <div class="space-y-2">
+          <h2 class="text-sm font-bold tracking-[0.1em] text-on-surface" data-i18n="auth.githubRequired">此 CloudSSH 实例需要 GitHub 登录</h2>
+          <p class="mx-auto max-w-md text-xs leading-6 text-muted" data-i18n="auth.githubRequiredHint">登录成功且账号获得管理员授权后，才能使用 SSH 和账号功能。</p>
+        </div>
+        ${githubAuthEnabled
+          ? '<span id="github-login-placeholder"></span>'
+          : '<p class="text-xs text-error" data-i18n="auth.githubNotConfigured">管理员尚未完整配置 GitHub OAuth，当前无法登录。</p>'}
+      </div>
+    `;
+    translateDocument(container);
+    if (githubAuthEnabled) this.renderGitHubLoginButton();
   }
 
   private renderGitHubLoginButton(): void {
@@ -112,12 +150,19 @@ export class ConnectionForm {
     const container = document.getElementById('turnstile-widget');
     if (!container || !window.turnstile) return;
 
+    if (this.turnstileWidgetId) {
+      window.turnstile.remove(this.turnstileWidgetId);
+      this.turnstileWidgetId = null;
+      container.replaceChildren();
+    }
+
     const wrapper = document.getElementById('turnstile-container');
     if (wrapper) wrapper.style.display = 'block';
 
+    this.turnstileTheme = getActiveColorScheme();
     this.turnstileWidgetId = window.turnstile.render(container, {
       sitekey: this.turnstileSitekey,
-      theme: 'dark',
+      theme: this.turnstileTheme,
       callback: async (token: string) => {
         // Verify with backend and get cookie
         try {
@@ -153,22 +198,22 @@ export class ConnectionForm {
       <form class="space-y-6" id="connection-form">
         <div class="grid grid-cols-1 sm:grid-cols-4 gap-4">
           <div class="sm:col-span-3">
-            <label class="block text-xs font-bold tracking-[0.1em] text-muted mb-2" data-i18n="auth.host">主机地址</label>
+            <label for="host" class="block text-xs font-bold tracking-[0.1em] text-muted mb-2" data-i18n="auth.host">主机地址</label>
             <div class="flex items-center">
               <span class="text-muted mr-2">&gt;</span>
                <input id="host" class="terminal-input text-[13px]" placeholder="192.168.1.1 or 2001:db8::1" type="text" required>
             </div>
           </div>
           <div class="sm:col-span-1">
-            <label class="block text-xs font-bold tracking-[0.1em] text-muted mb-2" data-i18n="auth.port">端口</label>
+            <label for="port" class="block text-xs font-bold tracking-[0.1em] text-muted mb-2" data-i18n="auth.port">端口</label>
             <div class="flex items-center">
               <span class="text-muted mr-2">:</span>
-              <input id="port" class="terminal-input text-[13px]" placeholder="22" type="text" value="22">
+              <input id="port" class="terminal-input text-[13px]" placeholder="22" type="number" inputmode="numeric" min="1" max="65535" step="1" value="22" required>
             </div>
           </div>
         </div>
         <div>
-          <label class="block text-xs font-bold tracking-[0.1em] text-muted mb-2" data-i18n="auth.user">用户名</label>
+          <label for="username" class="block text-xs font-bold tracking-[0.1em] text-muted mb-2" data-i18n="auth.user">用户名</label>
           <div class="flex items-center">
             <span class="material-symbols-outlined text-muted mr-2" style="font-size: 16px;">person</span>
             <input id="username" class="terminal-input text-[13px]" placeholder="admin" type="text" required>
@@ -183,11 +228,11 @@ export class ConnectionForm {
           <div id="auth-password-section">
             <div class="flex items-center">
               <span class="material-symbols-outlined text-muted mr-2" style="font-size: 16px;">key</span>
-              <input id="password" class="terminal-input text-[13px]" placeholder="••••••••" type="password">
+              <input id="password" class="terminal-input text-[13px]" placeholder="••••••••" type="password" data-i18n-aria-label="common.password" aria-label="密码">
             </div>
           </div>
           <div id="auth-key-section" style="display:none;">
-            <textarea id="private-key" class="terminal-input text-[11px] w-full" rows="5" data-i18n-placeholder="auth.keyPlaceholder" placeholder="-----BEGIN OPENSSH PRIVATE KEY-----&#10;...粘贴私钥内容...&#10;-----END OPENSSH PRIVATE KEY-----" style="resize:vertical;border:1px solid var(--border-strong);padding:8px;"></textarea>
+            <textarea id="private-key" class="terminal-input text-[11px] w-full" rows="5" data-i18n-placeholder="auth.keyPlaceholder" data-i18n-aria-label="common.privateKey" aria-label="私钥" placeholder="-----BEGIN OPENSSH PRIVATE KEY-----&#10;...粘贴私钥内容...&#10;-----END OPENSSH PRIVATE KEY-----" style="resize:vertical;border:1px solid var(--border-strong);padding:8px;"></textarea>
             <div class="flex items-center gap-2 mt-2">
               <label for="private-key-file" class="text-[11px] text-muted hover:text-primary cursor-pointer flex items-center gap-1 border border-dim px-2 py-1 hover:border-[var(--accent)] transition-all">
                 <span class="material-symbols-outlined" style="font-size: 14px;">upload_file</span>
@@ -202,7 +247,7 @@ export class ConnectionForm {
           <div id="turnstile-widget" class="flex justify-center"></div>
         </div>
         <div>
-          <label class="block text-xs font-bold tracking-[0.1em] text-muted mb-2"><span data-i18n="auth.regionHint">连接区域</span> <span class="text-[9px] opacity-60" data-i18n="auth.regionOptional">可选；自动模式由 Cloudflare 调度</span></label>
+          <label for="anon-region" class="block text-xs font-bold tracking-[0.1em] text-muted mb-2"><span data-i18n="auth.regionHint">连接区域</span> <span class="text-[9px] opacity-60" data-i18n="auth.regionOptional">可选；自动模式由 Cloudflare 调度</span></label>
           <select id="anon-region" class="terminal-input text-[13px] cursor-pointer" style="border:1px solid var(--border-strong);border-bottom:1px solid var(--border-strong);padding:6px 8px;">
             <option value="">自动</option>
           </select>
@@ -212,7 +257,7 @@ export class ConnectionForm {
           <label for="remember-me" class="text-xs text-muted cursor-pointer select-none" data-i18n="auth.remember">记住连接信息</label>
         </div>
         <div class="pt-4">
-          <button id="connect-btn" class="connect-btn w-full py-3 px-4 text-xs font-bold tracking-[0.1em] uppercase flex items-center justify-center gap-2" type="button">
+          <button id="connect-btn" class="connect-btn w-full py-3 px-4 text-xs font-bold tracking-[0.1em] uppercase flex items-center justify-center gap-2" type="submit">
             <span class="material-symbols-outlined" style="font-size: 18px;">power_settings_new</span>
             <span data-i18n="auth.execute">建立连接</span>
           </button>
@@ -232,12 +277,9 @@ export class ConnectionForm {
     `;
     translateDocument(container);
 
-    document.getElementById('connect-btn')!.addEventListener('click', () => {
-      this.handleConnect();
-    });
-
-    document.getElementById('connection-form')!.addEventListener('keypress', (e) => {
-      if (e.key === 'Enter') this.handleConnect();
+    document.getElementById('connection-form')!.addEventListener('submit', (event) => {
+      event.preventDefault();
+      void this.handleConnect();
     });
 
     // 填充区域下拉选项（自动选项已存在于 HTML，populateRegionSelect 会完整替换）
@@ -444,12 +486,13 @@ export class ConnectionForm {
   private async handleConnect(): Promise<void> {
     const hostInput = (document.getElementById('host') as HTMLInputElement).value;
     const host = hostInput.replace(/^\[|\]$/g, '').trim();
-    const port = parseInt(
-      (document.getElementById('port') as HTMLInputElement).value || '22'
-    );
+    const portInput = document.getElementById('port') as HTMLInputElement;
+    const port = parsePort(portInput.value);
     const username = (document.getElementById('username') as HTMLInputElement).value;
     const password = (document.getElementById('password') as HTMLInputElement).value;
     const privateKey = (document.getElementById('private-key') as HTMLTextAreaElement).value;
+    const selectedPassword = this.authMode === 'password' ? password : undefined;
+    const selectedPrivateKey = this.authMode === 'key' ? privateKey : undefined;
     const remember = (document.getElementById('remember-me') as HTMLInputElement).checked;
     // 匿名路径区域选择（仅作为 manual override；系统不会对此路径自动推断）
     const anonRegionSelect = document.getElementById('anon-region') as HTMLSelectElement | null;
@@ -458,6 +501,12 @@ export class ConnectionForm {
     if (!host || !username) {
       notify(t('auth.validationHostUser'), { title: t('auth.incompleteConnection'), variant: 'warning' });
       (document.getElementById(!host ? 'host' : 'username') as HTMLInputElement)?.focus();
+      return;
+    }
+
+    if (port === null) {
+      notify(t('auth.validationPort'), { title: t('auth.incompleteConnection'), variant: 'warning' });
+      portInput.focus();
       return;
     }
 
@@ -487,8 +536,8 @@ export class ConnectionForm {
         host,
         port: port.toString(),
         username,
-        password,
-        privateKey: this.authMode === 'key' ? privateKey : undefined,
+        password: selectedPassword ?? '',
+        privateKey: selectedPrivateKey,
         authMethod: this.authMode === 'key' ? 'publickey' : 'password',
       });
     }
@@ -548,9 +597,9 @@ export class ConnectionForm {
         host,
         port,
         username,
-        password,
+        password: selectedPassword,
         authMethod: this.authMode === 'key' ? 'publickey' : 'password',
-        privateKey,
+        privateKey: selectedPrivateKey,
         expectedFingerprint: expectedFingerprint || undefined,
         locationHint: regionValue || undefined,
       });

@@ -26,4 +26,10 @@ LICENSE
 
 # 本地开发配置
 .dev.vars
+.dev.vars.*
+.env
+.env.*
 .wrangler/
+.pnpm-store/
+.idea/
+.vscode/

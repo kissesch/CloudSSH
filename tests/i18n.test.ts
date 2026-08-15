@@ -68,6 +68,46 @@ describe('国际化核心', () => {
     expect(source).toContain("label: t('sftp.contextDelete')");
     expect(source).not.toMatch(/label:\s*'(?:Open|Download|Rename|Delete)'/);
   });
+
+  it('SFTP 连接、传输和统计状态均通过语言包展示', () => {
+    const source = readFileSync(new URL('../frontend/src/sftp-panel.ts', import.meta.url), 'utf8');
+    for (const key of [
+      'sftp.reconnecting',
+      'sftp.waitingWebSocket',
+      'sftp.invalidResponse',
+      'sftp.websocketError',
+      'sftp.connectionClosed',
+      'sftp.uploading',
+      'sftp.downloading',
+      'sftp.uploadFailed',
+      'sftp.downloadFailed',
+      'sftp.uploadCancelled',
+      'sftp.downloadCancelled',
+      'sftp.renamed',
+      'sftp.queuedUpload',
+      'sftp.queuedDownload',
+      'sftp.itemCounts',
+      'sftp.items',
+    ]) {
+      expect(source).toContain(`t('${key}'`);
+    }
+    expect(source).not.toMatch(
+      /'(?:Reconnecting SFTP|Waiting for SFTP|Invalid SFTP response|Upload failed:|Download failed:|Uploading:|Downloading:|Upload cancelled|Download cancelled|Renamed)'/,
+    );
+  });
+
+  it('SFTP 同名覆盖确认提供完整中英文文案', () => {
+    expect(zhCN['sftp.overwriteTitle']).toBe('覆盖同名文件');
+    expect(zhCN['sftp.overwriteMessage']).toContain('{existingSize}');
+    expect(zhCN['sftp.overwriteMessage']).toContain('{newSize}');
+    expect(enUS['sftp.overwriteTitle']).toBe('Overwrite existing file');
+
+    const source = readFileSync(new URL('../frontend/src/sftp-panel.ts', import.meta.url), 'utf8');
+    expect(source).toContain("title: t('sftp.overwriteTitle')");
+    expect(source).toContain("confirmText: t('sftp.overwrite')");
+    expect(source).toContain("overwrite: false");
+    expect(source).toContain("overwrite: true");
+  });
 });
 
 describe('Agent 响应语言', () => {
@@ -92,6 +132,13 @@ describe('语言切换入口', () => {
 
 describe('主题在线编辑器国际化', () => {
   const html = readFileSync(new URL('../docs/theme-editor/index.html', import.meta.url), 'utf8');
+  const currentProjectUi = [
+    readFileSync(new URL('../frontend/index.html', import.meta.url), 'utf8'),
+    readFileSync(new URL('../frontend/src/style.css', import.meta.url), 'utf8'),
+    readFileSync(new URL('../frontend/src/server-list.ts', import.meta.url), 'utf8'),
+    readFileSync(new URL('../frontend/src/tab-manager.ts', import.meta.url), 'utf8'),
+    readFileSync(new URL('../frontend/src/agent/agent-panel.ts', import.meta.url), 'utf8'),
+  ].join('\n');
 
   it('与主项目共用语言偏好，并支持 URL、持久化设置和浏览器语言', () => {
     expect(html).toContain("const LOCALE_STORAGE_KEY = 'cloudssh_locale'");
@@ -114,5 +161,25 @@ describe('主题在线编辑器国际化', () => {
     expect(html).toContain("'--scrollbar-thumb-hover'");
     expect(html).toContain('id="toast-region"');
     expect(html).not.toMatch(/\b(?:window\.)?(?:alert|confirm|prompt)\s*\(/);
+  });
+
+  it('同步服务器搜索、区域、网络质量、终端选区和 Agent 代码块 UI', () => {
+    for (const marker of [
+      'server.searchPlaceholder',
+      'server.regionLabel',
+      'network-quality-dot',
+      'ask-ai-selection',
+      'agent-md-code-block',
+      'agent-md-code-action',
+    ]) {
+      expect(currentProjectUi).toContain(marker);
+      expect(html).toContain(marker);
+    }
+
+    expect(html).toContain('data-i18n="terminal.askAISelection"');
+    expect(html).toContain('data-i18n="agent.codeFill"');
+    expect(html).toContain('<option value="standard-dark">Standard Dark</option>');
+    expect(html).toContain('<option value="standard-light">Standard Light</option>');
+    expect(html).toContain("select.addEventListener('change', (event) => initTheme(event.target.value))");
   });
 });

@@ -37,6 +37,8 @@ export interface ECDHResult {
 export interface AuthResult {
   success: boolean;
   allowedMethods?: string[];
+  /** RFC 4252: whether a previous authentication step partially succeeded. */
+  partialSuccess?: boolean;
 }
 
 export interface SSHConnectionConfig {
@@ -49,8 +51,14 @@ export interface SSHConnectionConfig {
   cols?: number;
   rows?: number;
   expectedFingerprint?: string;
+  /** Path-scoped known-host identity; defaults to host for direct connections. */
+  knownHostIdentity?: string;
   userId?: string;
   githubId?: string;
+  /** 已保存服务器的记录 ID（token 路径下由 handleConnectServer 填充，供 OS 检测持久化） */
+  serverId?: number;
+  /** 已检测并持久化的操作系统标识（已设置则连接时跳过重复检测） */
+  os?: string | null;
   /**
    * Cloudflare DO locationHint。
    * - 用户保存服务器时手动覆盖的 `region` → 优先使用
@@ -59,6 +67,21 @@ export interface SSHConnectionConfig {
    * 连接时仅做白名单过滤（实际取值由 user-db.handleConnectServer 计算）。
    */
   locationHint?: string;
+  /** Saved jump hosts ordered from the public entry hop toward this target. */
+  jumpHosts?: SSHJumpHostConfig[];
+}
+
+export interface SSHJumpHostConfig {
+  serverId: number;
+  name: string;
+  host: string;
+  port: number;
+  username: string;
+  password: string;
+  authMethod: 'password' | 'publickey';
+  privateKey: string;
+  expectedFingerprint?: string;
+  knownHostIdentity: string;
 }
 
 /**
@@ -110,6 +133,10 @@ export interface Env {
   // GitHub OAuth（可选，未配置则登录功能自动禁用）
   GITHUB_CLIENT_ID?: string;
   GITHUB_CLIENT_SECRET?: string;
+  // GitHub 登录白名单（可选，逗号分隔的数字 GitHub user ID；未配置则不限制）
+  GITHUB_ALLOWED_USER_IDS?: string;
+  // 是否强制 GitHub 登录后才能使用 SSH（可选，默认 false）
+  REQUIRE_GITHUB_AUTH?: string;
   BASE_URL?: string;
   // 主机密钥验证严格模式（默认 true，设为 false 可跳过签名验证失败）
   STRICT_HOST_KEY_VERIFY?: string;
@@ -134,8 +161,14 @@ export interface ServerConfig {
   auth_method: 'password' | 'publickey';
   /** 用户手动指定的区域偏好；空表示 Auto（依赖系统推断的 inferred_hint） */
   region?: string | null;
-  /** 系统在保存/更新服务器时通过 ipapi.co 自动推断并持久化的 hint */
+  /** 系统在保存/更新服务器时通过第三方 IPinfo 自动推断并持久化的 hint */
   inferred_hint?: string | null;
+  /** 用户用于组织和筛选服务器的单层标签 */
+  tags: string[];
+  /** 连接时检测到的远端操作系统（canonical key，如 ubuntu/debian/centos） */
+  os?: string | null;
+  /** Optional saved server used as the immediate SSH jump host. */
+  jump_server_id?: number | null;
   created_at: string;
   updated_at: string;
 }
@@ -154,6 +187,11 @@ export const SSH_MSG_KEX_ECDH_REPLY = 31;
 export const SSH_MSG_USERAUTH_REQUEST = 50;
 export const SSH_MSG_USERAUTH_FAILURE = 51;
 export const SSH_MSG_USERAUTH_SUCCESS = 52;
+// User-auth message numbers 60/61 are method-specific. These names apply only
+// while keyboard-interactive is active; 60 is PK_OK/PASSWD_CHANGEREQ in the
+// publickey/password methods and must be disambiguated by session state.
+export const SSH_MSG_USERAUTH_INFO_REQUEST = 60;
+export const SSH_MSG_USERAUTH_INFO_RESPONSE = 61;
 export const SSH_MSG_GLOBAL_REQUEST = 80;
 export const SSH_MSG_REQUEST_SUCCESS = 81;
 export const SSH_MSG_REQUEST_FAILURE = 82;

@@ -5,11 +5,59 @@ import { WebglAddon } from '@xterm/addon-webgl';
 import { SearchAddon } from '@xterm/addon-search';
 import { TrzszFilter } from 'trzsz';
 import '@xterm/xterm/css/xterm.css';
+import { copyTextToClipboard } from './clipboard';
 import { t } from './i18n';
+import { confirmAction, notify } from './ui-feedback';
+import {
+  normalizeChangedHostKeyMessage,
+  normalizeVerifiedHostKeyMessage,
+  saveKnownFingerprint,
+  type ChangedHostKeyMessage,
+} from './known-hosts';
+import {
+  AuthChallengeDialog,
+  type AuthChallengeSubmission,
+} from './auth-challenge-dialog';
 import { centerTerminalText } from './terminal-text';
 import { localizedSSHMessage } from './terminal-status';
+import {
+  getActiveTerminalTheme,
+  onTerminalThemeChange,
+} from './theme';
+import {
+  applyMobileModifier,
+  diffTextareaInput,
+  isIOSLike,
+  type MobileModifier,
+  type MobileTerminalKey,
+  mobileTerminalKeySequence,
+} from './mobile-input';
+import { currentTerminalFontSize } from './terminal-layout';
 
 const TRZSZ_MAX_DATA_CHUNK_SIZE = 2 * 1024 * 1024;
+const NON_RETRIABLE_AUTH_EVENTS = new Set([
+  'auth_failed',
+  'auth_interactive_protocol_error',
+  'auth_interactive_limit',
+  'auth_interactive_client_unavailable',
+  'auth_interactive_timeout',
+  'auth_interactive_invalid_response',
+  'auth_interactive_failed',
+  'auth_password_change_required',
+  'auth_protocol_error',
+]);
+const RTT_HEARTBEAT_INTERVAL_MS = 5000;
+const HEARTBEAT_RESPONSE_TIMEOUT_MS = 10_000;
+
+export interface SSHHostInfo {
+  host: string;
+  port: number;
+  username?: string;
+  /** 登录用户保存的服务器 ID，用于断线后重新申请一次性连接令牌。 */
+  serverId?: number;
+}
+
+export type ReconnectWebSocketFactory = () => Promise<WebSocket>;
 
 export interface SSHConnectionConfig {
   host: string;
@@ -23,120 +71,41 @@ export interface SSHConnectionConfig {
   locationHint?: string;
 }
 
+export interface TerminalSelectionAnchor {
+  clientX: number;
+  clientY: number;
+}
+
 interface ConnectOptions {
   resetDisplay?: boolean;
 }
 
-export const THEMES = {
-  cyberpunk: {
-    background: '#0a0a0a',
-    foreground: '#4af626',
-    cursor: '#14d1ff',
-    cursorAccent: '#0a0a0a',
-    selectionBackground: '#273747',
-  },
-  glacier: {
-    background: '#0a192f',
-    foreground: '#64ffda',
-    cursor: '#e6f1ff',
-    cursorAccent: '#0a192f',
-    selectionBackground: '#112240',
-  },
-  gruvbox: {
-    background: '#282828',
-    foreground: '#ebdbb2',
-    cursor: '#d3869b',
-    cursorAccent: '#282828',
-    selectionBackground: '#504945',
-  }
-};
+interface WebSocketConnectOptions extends ConnectOptions {
+  reconnectFactory?: ReconnectWebSocketFactory;
+}
 
-export const UI_THEMES: Record<keyof typeof THEMES, Record<string, string>> = {
-  cyberpunk: {
-    '--bg': '#0a0a0a',
-    '--bg-surface': '#121212',
-    '--bg-elevated': '#131313',
-    '--bg-terminal': '#0e0e0e',
-    '--text': '#4af626',
-    '--text-muted': '#bbccb0',
-    '--text-dim': '#3c4b36',
-    '--accent': '#4af626',
-    '--accent-secondary': '#14d1ff',
-    '--accent-secondary-light': '#b7eaff',
-    '--border': '#1f1f1f',
-    '--border-strong': '#3c4b36',
-    '--error': '#ffb4ab',
-    '--error-bg': '#93000a',
-    '--on-accent': '#022100',
-    '--surface-dot': '#353534',
-    '--scrollbar-track': 'rgba(28, 27, 27, 0.5)',
-    '--scrollbar-thumb': 'rgba(60, 75, 54, 0.8)',
-    '--scrollbar-thumb-hover': 'rgba(134, 149, 125, 0.8)',
-    '--scanline-tint': 'rgba(74, 246, 38, 0.02)',
-    '--accent-glow': 'rgba(74, 246, 38, 0.08)',
-    '--modal-overlay': 'rgba(0, 0, 0, 0.8)',
-    '--on-surface': '#e5e2e1',
-    '--on-surface-variant': '#bbccb0',
-    '--agent-user-color': '#4af626',
-    '--agent-agent-color': '#14d1ff',
-  },
-  glacier: {
-    '--bg': '#0a192f',
-    '--bg-surface': '#0d2137',
-    '--bg-elevated': '#112240',
-    '--bg-terminal': '#061526',
-    '--text': '#64ffda',
-    '--text-muted': '#8892b0',
-    '--text-dim': '#495670',
-    '--accent': '#64ffda',
-    '--accent-secondary': '#e6f1ff',
-    '--accent-secondary-light': '#ccd6f6',
-    '--border': '#1d3557',
-    '--border-strong': '#495670',
-    '--error': '#ff6b6b',
-    '--error-bg': '#3d0000',
-    '--on-accent': '#0a192f',
-    '--surface-dot': '#1d3557',
-    '--scrollbar-track': 'rgba(10, 25, 47, 0.5)',
-    '--scrollbar-thumb': 'rgba(100, 255, 218, 0.2)',
-    '--scrollbar-thumb-hover': 'rgba(100, 255, 218, 0.4)',
-    '--scanline-tint': 'rgba(100, 255, 218, 0.02)',
-    '--accent-glow': 'rgba(100, 255, 218, 0.08)',
-    '--modal-overlay': 'rgba(0, 0, 0, 0.85)',
-    '--on-surface': '#e6f1ff',
-    '--on-surface-variant': '#8892b0',
-    '--agent-user-color': '#64ffda',
-    '--agent-agent-color': '#e6f1ff',
-  },
-  gruvbox: {
-    '--bg': '#282828',
-    '--bg-surface': '#303030',
-    '--bg-elevated': '#282828',
-    '--bg-terminal': '#1d2021',
-    '--text': '#ebdbb2',
-    '--text-muted': '#a89984',
-    '--text-dim': '#665c54',
-    '--accent': '#b8bb26',
-    '--accent-secondary': '#83a598',
-    '--accent-secondary-light': '#8ec07c',
-    '--border': '#3c3836',
-    '--border-strong': '#665c54',
-    '--error': '#fb4934',
-    '--error-bg': '#3d0000',
-    '--on-accent': '#282828',
-    '--surface-dot': '#3c3836',
-    '--scrollbar-track': 'rgba(40, 40, 40, 0.5)',
-    '--scrollbar-thumb': 'rgba(168, 153, 132, 0.3)',
-    '--scrollbar-thumb-hover': 'rgba(168, 153, 132, 0.5)',
-    '--scanline-tint': 'rgba(184, 187, 38, 0.02)',
-    '--accent-glow': 'rgba(184, 187, 38, 0.08)',
-    '--modal-overlay': 'rgba(0, 0, 0, 0.75)',
-    '--on-surface': '#ebdbb2',
-    '--on-surface-variant': '#a89984',
-    '--agent-user-color': '#b8bb26',
-    '--agent-agent-color': '#83a598',
-  },
-};
+interface TerminalCell {
+  column: number;
+  row: number;
+}
+
+interface MobileScrollGesture {
+  pointerId: number;
+  startX: number;
+  startY: number;
+  lastY: number;
+  remainder: number;
+  active: boolean;
+}
+
+const MOBILE_SCROLL_START_THRESHOLD_PX = 10;
+const MOBILE_VIEWPORT_QUERY = '(max-width: 767px), (max-width: 1180px) and (pointer: coarse)';
+const MOBILE_CONNECTION_RECOVERY_QUERY = '(pointer: coarse)';
+
+function supportsMobileConnectionRecovery(): boolean {
+  return navigator.maxTouchPoints > 0
+    && (window.matchMedia?.(MOBILE_CONNECTION_RECOVERY_QUERY).matches ?? false);
+}
 
 export class SSHTerminal {
   private terminal: Terminal;
@@ -144,6 +113,7 @@ export class SSHTerminal {
   private webglAddon!: WebglAddon;
   private searchAddon: SearchAddon;
   private ws: WebSocket | null = null;
+  private authChallengeDialog: AuthChallengeDialog | null = null;
   private container: HTMLElement;
   private disposables: { dispose(): void }[] = [];
   private terminalDisposables: { dispose(): void }[] = [];
@@ -154,11 +124,15 @@ export class SSHTerminal {
   private maxReconnectAttempts: number = 5;
   private reconnectTimeout: ReturnType<typeof setTimeout> | null = null;
   private lastConfig: SSHConnectionConfig | null = null;
+  private lastHostInfo: SSHHostInfo | null = null;
+  private reconnectWebSocketFactory: ReconnectWebSocketFactory | null = null;
   private canReconnect: boolean = true;
+  private sessionReady: boolean = false;
   private restoreCursorBlinkAfterReturnPrompt: boolean = false;
-  private onSessionClosed?: (event: CloseEvent) => void;
+  private onSessionClosed?: (event: CloseEvent, willReconnect: boolean) => void;
   private onSessionReady?: () => void;
   private onAgentFrameHandler?: (msg: any) => void;
+  private onOSDetectedHandler?: (serverId: number, os: string) => void;
   private sftpAttachUrl: string | null = null;
   private searchBox: HTMLElement | null = null;
   private searchInput: HTMLInputElement | null = null;
@@ -166,20 +140,136 @@ export class SSHTerminal {
   private cfLatency: number | null = null;
   private cfColo: string | null = null;
   private lastPingTime: number | null = null;
+  private pendingHeartbeatId: string | null = null;
+  private heartbeatResponseTimeout: ReturnType<typeof setTimeout> | null = null;
+  private pageHiddenAt: number | null = null;
   private wsLatency: number | null = null;
   private onLatencyUpdated?: (cfLatency: number | null, cfColo: string | null, wsLatency: number | null) => void;
+  private onSelectionChanged?: (selection: string, anchor: TerminalSelectionAnchor | null) => void;
+  private selectionAnchor: TerminalSelectionAnchor | null = null;
+  private selectionPointerActive = false;
+  private mobileSelectionMode = false;
+  private mobileSelectionPointerId: number | null = null;
+  private mobileSelectionStart: TerminalCell | null = null;
+  private mobileScrollGesture: MobileScrollGesture | null = null;
+  private mobileModifier: MobileModifier | null = null;
+  private imeTextarea: HTMLTextAreaElement | null = null;
+  private imePendingBaseline: string | null = null;
+  private imePendingHandled = false;
+  private imeKeyupTimer: ReturnType<typeof setTimeout> | null = null;
+  private viewportRestoreFrame: number | null = null;
+  private readonly mobileConnectionRecoveryEnabled: boolean;
+  private pendingHostKeyChangeSocket: WebSocket | null = null;
+  private readonly contextMenuPasteListener = async (event: MouseEvent): Promise<void> => {
+    if (window.matchMedia?.('(pointer: coarse)').matches) return;
+    event.preventDefault();
+    await this.pasteFromClipboard();
+  };
+  private themeCleanup: () => void;
   private resizeListener: () => void;
+  private readonly selectionPointerDownListener = (event: PointerEvent): void => {
+    if (event.button !== 0) return;
+    this.selectionPointerActive = true;
+    this.selectionAnchor = { clientX: event.clientX, clientY: event.clientY };
+    if (this.mobileSelectionMode && event.pointerType !== 'mouse') {
+      const cell = this.getTerminalCell(event.clientX, event.clientY);
+      if (!cell) {
+        this.selectionPointerActive = false;
+        return;
+      }
+      event.preventDefault();
+      this.mobileSelectionPointerId = event.pointerId;
+      this.mobileSelectionStart = cell;
+      try {
+        this.container.setPointerCapture?.(event.pointerId);
+      } catch { /* synthetic events and older browsers may not support capture */ }
+      this.updateMobileSelection(cell);
+      return;
+    }
+    this.beginMobileScroll(event);
+  };
+  private readonly selectionPointerMoveListener = (event: PointerEvent): void => {
+    if (!this.selectionPointerActive) return;
+    this.selectionAnchor = { clientX: event.clientX, clientY: event.clientY };
+    if (this.mobileSelectionPointerId === event.pointerId && this.mobileSelectionStart) {
+      event.preventDefault();
+      const cell = this.getTerminalCell(event.clientX, event.clientY);
+      if (cell) this.updateMobileSelection(cell);
+      return;
+    }
+    if (this.updateMobileScroll(event)) return;
+    if (this.terminal.hasSelection()) {
+      this.notifySelectionChanged();
+    }
+  };
+  private readonly selectionPointerUpListener = (event: PointerEvent): void => {
+    if (!this.selectionPointerActive) return;
+    if (this.mobileSelectionPointerId === event.pointerId && this.mobileSelectionStart) {
+      event.preventDefault();
+      const cell = this.getTerminalCell(event.clientX, event.clientY);
+      if (cell) this.updateMobileSelection(cell);
+      this.finishMobileSelectionPointer();
+      this.selectionPointerActive = false;
+      this.selectionAnchor = { clientX: event.clientX, clientY: event.clientY };
+      this.notifySelectionChanged();
+      return;
+    }
+    const handledMobileScroll = this.finishMobileScroll(event.pointerId);
+    if (handledMobileScroll) {
+      event.preventDefault();
+      event.stopPropagation();
+    }
+    this.selectionPointerActive = false;
+    this.selectionAnchor = { clientX: event.clientX, clientY: event.clientY };
+    this.notifySelectionChanged();
+    const selection = this.terminal.getSelection();
+    if (selection && event.pointerType !== 'touch') {
+      void this.copySelectionToClipboard(selection);
+    }
+  };
+  private readonly selectionPointerCancelListener = (event: PointerEvent): void => {
+    if (this.mobileSelectionPointerId === event.pointerId) {
+      this.finishMobileSelectionPointer();
+    }
+    this.finishMobileScroll(event.pointerId);
+    this.selectionPointerActive = false;
+  };
+  private readonly visibilityChangeListener = (): void => {
+    if (document.visibilityState === 'hidden') {
+      this.pageHiddenAt = Date.now();
+      // 后台页面可能冻结所有定时器。清除旧探测，回到前台后重新验证，
+      // 避免一个在后台过期的计时器把仍健康的连接误判为断线。
+      this.stopHeartbeat();
+      return;
+    }
+    this.verifyConnectionAfterResume();
+  };
+  private readonly pageShowListener = (): void => {
+    if (document.visibilityState !== 'hidden') this.verifyConnectionAfterResume();
+  };
+  private readonly onlineListener = (): void => {
+    if (document.visibilityState !== 'hidden') this.verifyConnectionAfterResume();
+  };
 
   constructor(containerId: string) {
     this.container = document.getElementById(containerId)!;
-    this.resizeListener = () => this.fit();
+    // 桌面浏览器切换标签页也会触发 visibilitychange，但通常不会挂起网络栈。
+    // 仅在手机/平板这类以触摸为主的环境监听后台恢复，避免无意义的探测和日志。
+    this.mobileConnectionRecoveryEnabled = supportsMobileConnectionRecovery();
+    this.resizeListener = () => {
+      // visualViewport 的连续变化由 MobileTerminalController 稳定后统一处理，
+      // 桌面端和不支持 visualViewport 的浏览器仍保留直接适配。
+      const mobileViewportManaged = Boolean(window.visualViewport)
+        && (window.matchMedia?.(MOBILE_VIEWPORT_QUERY).matches ?? false);
+      if (!mobileViewportManaged) this.fit();
+    };
 
     this.terminal = new Terminal({
       cursorBlink: true,
       cursorStyle: 'block',
-      fontSize: 14,
+      fontSize: currentTerminalFontSize(),
       fontFamily: '"JetBrains Mono", "Fira Code", "Cascadia Code", monospace',
-      theme: THEMES.cyberpunk,
+      theme: getActiveTerminalTheme(),
       allowProposedApi: true,
       scrollback: 10000,
     });
@@ -189,7 +279,19 @@ export class SSHTerminal {
     this.terminal.loadAddon(new WebLinksAddon());
     this.searchAddon = new SearchAddon();
     this.terminal.loadAddon(this.searchAddon);
+    this.themeCleanup = onTerminalThemeChange((theme) => {
+      this.terminal.options.theme = theme;
+    });
     this.registerCursorRestoreHandlers();
+    this.terminalDisposables.push(
+      this.terminal.onSelectionChange(() => {
+        this.notifySelectionChanged();
+      }),
+    );
+    this.container.addEventListener('pointerdown', this.selectionPointerDownListener, true);
+    this.container.addEventListener('pointermove', this.selectionPointerMoveListener, true);
+    window.addEventListener('pointerup', this.selectionPointerUpListener, true);
+    window.addEventListener('pointercancel', this.selectionPointerCancelListener, true);
 
     // Ctrl+Shift+F to toggle search bar
     this.terminal.attachCustomKeyEventHandler((e: KeyboardEvent) => {
@@ -206,19 +308,14 @@ export class SSHTerminal {
     });
 
     window.addEventListener('resize', this.resizeListener);
+    if (this.mobileConnectionRecoveryEnabled) {
+      document.addEventListener('visibilitychange', this.visibilityChangeListener);
+      window.addEventListener('pageshow', this.pageShowListener);
+    }
+    window.addEventListener('online', this.onlineListener);
 
-    // Right-click paste support
-    this.container.addEventListener('contextmenu', async (e) => {
-      e.preventDefault();
-      try {
-        const text = await navigator.clipboard.readText();
-        if (text && this.ws?.readyState === WebSocket.OPEN) {
-          this.ws.send(text);
-        }
-      } catch (err) {
-        console.error('Failed to read clipboard', err);
-      }
-    });
+    // 右键粘贴（选区已通过鼠标松手自动复制到剪贴板）
+    this.container.addEventListener('contextmenu', this.contextMenuPasteListener);
 
     // Drag-and-drop file upload support (trzsz)
     this.container.addEventListener('dragover', (e) => {
@@ -236,31 +333,7 @@ export class SSHTerminal {
     });
   }
 
-  setTheme(themeName: keyof typeof THEMES): void {
-    this.terminal.options.theme = THEMES[themeName];
-    const uiVars = UI_THEMES[themeName];
-    if (uiVars) {
-      const root = document.documentElement;
-      Object.entries(uiVars).forEach(([prop, val]) => {
-        root.style.setProperty(prop, val);
-      });
-    }
-    localStorage.setItem('cloudssh_theme', themeName);
-  }
-
-  applyImportedTheme(data: { terminal?: Record<string, string>; ui?: Record<string, string> }): void {
-    if (data.terminal) {
-      this.terminal.options.theme = data.terminal as any;
-    }
-    if (data.ui) {
-      const root = document.documentElement;
-      Object.entries(data.ui).forEach(([prop, val]) => {
-        root.style.setProperty(prop, val);
-      });
-    }
-  }
-
-  setSessionClosedHandler(handler: (event: CloseEvent) => void): void {
+  setSessionClosedHandler(handler: (event: CloseEvent, willReconnect: boolean) => void): void {
     this.onSessionClosed = handler;
   }
 
@@ -272,10 +345,105 @@ export class SSHTerminal {
     this.onAgentFrameHandler = handler;
   }
 
+  setOSDetectedHandler(handler: (serverId: number, os: string) => void): void {
+    this.onOSDetectedHandler = handler;
+  }
+
   sendWebSocketMessage(data: string): void {
     if (this.ws?.readyState === WebSocket.OPEN) {
       this.ws.send(data);
     }
+  }
+
+  /** 通过与物理键盘相同的 trzsz 输入管线发送移动端快捷键。 */
+  sendInput(data: string): boolean {
+    if (!data || !this.sessionReady || this.ws?.readyState !== WebSocket.OPEN || !this.trzszFilter) return false;
+    this.processTerminalInput(data);
+    this.terminal.focus();
+    return true;
+  }
+
+  /** 按 xterm 当前 application cursor mode 发送移动端功能键。 */
+  sendMobileKey(key: MobileTerminalKey): boolean {
+    const data = mobileTerminalKeySequence(
+      key,
+      this.terminal.modes.applicationCursorKeysMode,
+      this.mobileModifier,
+    );
+    this.setMobileModifier(null);
+    return this.sendInput(data);
+  }
+
+  setMobileModifier(modifier: MobileModifier | null): void {
+    this.mobileModifier = modifier;
+    this.container.dispatchEvent(new CustomEvent('cloudssh:mobile-modifier-change', { bubbles: true }));
+  }
+
+  getMobileModifier(): MobileModifier | null {
+    return this.mobileModifier;
+  }
+
+  focus(): void {
+    this.terminal.focus();
+  }
+
+  blur(): void {
+    this.imeTextarea?.blur();
+  }
+
+  hasSelection(): boolean {
+    return this.terminal.hasSelection();
+  }
+
+  isMobileSelectionMode(): boolean {
+    return this.mobileSelectionMode;
+  }
+
+  setMobileSelectionMode(enabled: boolean): void {
+    if (this.mobileSelectionMode === enabled) return;
+    this.mobileSelectionMode = enabled;
+    this.container.classList.toggle('mobile-selection-mode', enabled);
+    if (!enabled) {
+      this.finishMobileSelectionPointer();
+      this.selectionPointerActive = false;
+    } else {
+      this.finishMobileScroll();
+    }
+  }
+
+  async copyCurrentSelection(): Promise<boolean> {
+    const selection = this.terminal.getSelection();
+    if (!selection) {
+      notify(t('terminal.noSelection'), { variant: 'info' });
+      return false;
+    }
+    return this.copySelectionToClipboard(selection);
+  }
+
+  async pasteFromClipboard(): Promise<boolean> {
+    try {
+      const text = await navigator.clipboard.readText();
+      if (!text || !this.sessionReady || this.ws?.readyState !== WebSocket.OPEN) return false;
+      // xterm 会统一换行，并且仅在远端显式启用 bracketed paste 时添加控制序列。
+      // paste() 还会经过 onData/trzsz 输入管线，与键盘粘贴保持一致。
+      this.setMobileModifier(null);
+      this.terminal.paste(text);
+      return true;
+    } catch (err) {
+      console.error('Failed to read clipboard', err);
+      notify(t('terminal.pasteFailed'), { variant: 'danger' });
+      return false;
+    }
+  }
+
+  /** 将文本填入当前远端终端输入行，不附加回车。 */
+  fillInput(text: string): boolean {
+    if (!text || /[\r\n]/.test(text)) return false;
+    if (!this.sessionReady || this.ws?.readyState !== WebSocket.OPEN || !this.trzszFilter) return false;
+
+    this.trzszFilter.processTerminalInput(text);
+    this.terminal.focus();
+    return true;
   }
 
   setLatencyUpdatedHandler(handler: (cfLatency: number | null, cfColo: string | null, wsLatency: number | null) => void): void {
@@ -285,8 +453,147 @@ export class SSHTerminal {
     }
   }
 
+  setSelectionChangeHandler(handler: (selection: string, anchor: TerminalSelectionAnchor | null) => void): void {
+    this.onSelectionChanged = handler;
+    this.notifySelectionChanged();
+  }
+
+  clearSelection(): void {
+    this.terminal.clearSelection();
+    this.selectionAnchor = null;
+    this.notifySelectionChanged();
+  }
+
   getSFTPWebSocketUrl(): string | null {
     return this.sftpAttachUrl;
+  }
+
+  private notifySelectionChanged(): void {
+    const selection = this.terminal.getSelection();
+    if (!selection) {
+      this.selectionAnchor = null;
+    }
+    this.onSelectionChanged?.(selection, this.selectionAnchor);
+  }
+
+  private getTerminalCell(clientX: number, clientY: number): TerminalCell | null {
+    const screen = this.container.querySelector<HTMLElement>('.xterm-screen');
+    const columns = this.terminal.cols;
+    const rows = this.terminal.rows;
+    if (!screen || columns < 1 || rows < 1) return null;
+
+    const rect = screen.getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0) return null;
+
+    const x = Math.min(Math.max(clientX - rect.left, 0), Math.max(0, rect.width - 0.01));
+    const y = Math.min(Math.max(clientY - rect.top, 0), Math.max(0, rect.height - 0.01));
+    const column = Math.min(columns - 1, Math.floor(x / rect.width * columns));
+    const viewportRow = Math.min(rows - 1, Math.floor(y / rect.height * rows));
+    return {
+      column,
+      row: this.terminal.buffer.active.viewportY + viewportRow,
+    };
+  }
+
+  private updateMobileSelection(end: TerminalCell): void {
+    if (!this.mobileSelectionStart) return;
+    const columns = this.terminal.cols;
+    const startOffset = this.mobileSelectionStart.row * columns + this.mobileSelectionStart.column;
+    const endOffset = end.row * columns + end.column;
+    const firstOffset = Math.min(startOffset, endOffset);
+    const lastOffset = Math.max(startOffset, endOffset);
+    this.terminal.select(
+      firstOffset % columns,
+      Math.floor(firstOffset / columns),
+      lastOffset - firstOffset + 1,
+    );
+  }
+
+  private finishMobileSelectionPointer(): void {
+    const pointerId = this.mobileSelectionPointerId;
+    if (pointerId !== null && this.container.hasPointerCapture?.(pointerId)) {
+      this.container.releasePointerCapture?.(pointerId);
+    }
+    this.mobileSelectionPointerId = null;
+    this.mobileSelectionStart = null;
+  }
+
+  private beginMobileScroll(event: PointerEvent): void {
+    if (event.pointerType === 'mouse' || this.mobileSelectionMode) return;
+    const target = event.target;
+    if (!(target instanceof Element) || !target.closest('.xterm-screen')) return;
+    // 备用屏幕和远端鼠标协议由远端应用控制，不能把滑动误当作本地历史滚动。
+    if (this.terminal.buffer.active.type !== 'normal'
+      || this.terminal.modes.mouseTrackingMode !== 'none') return;
+
+    this.mobileScrollGesture = {
+      pointerId: event.pointerId,
+      startX: event.clientX,
+      startY: event.clientY,
+      lastY: event.clientY,
+      remainder: 0,
+      active: false,
+    };
+  }
+
+  private updateMobileScroll(event: PointerEvent): boolean {
+    const gesture = this.mobileScrollGesture;
+    if (!gesture || gesture.pointerId !== event.pointerId) return false;
+
+    if (!gesture.active) {
+      const distanceX = Math.abs(event.clientX - gesture.startX);
+      const distanceY = Math.abs(event.clientY - gesture.startY);
+      if (distanceY < MOBILE_SCROLL_START_THRESHOLD_PX) return false;
+      if (distanceX > distanceY) {
+        this.finishMobileScroll(event.pointerId);
+        return false;
+      }
+      gesture.active = true;
+      try {
+        this.container.setPointerCapture?.(event.pointerId);
+      } catch { /* synthetic events and older browsers may not support capture */ }
+    }
+
+    event.preventDefault();
+    event.stopPropagation();
+    const cellHeight = this.getTerminalCellHeight();
+    if (cellHeight <= 0) return true;
+
+    gesture.remainder += gesture.lastY - event.clientY;
+    gesture.lastY = event.clientY;
+    const lines = Math.trunc(gesture.remainder / cellHeight);
+    if (lines !== 0) {
+      this.terminal.scrollLines(lines);
+      gesture.remainder -= lines * cellHeight;
+    }
+    return true;
+  }
+
+  private finishMobileScroll(pointerId?: number): boolean {
+    const gesture = this.mobileScrollGesture;
+    if (!gesture || (pointerId !== undefined && gesture.pointerId !== pointerId)) return false;
+    if (this.container.hasPointerCapture?.(gesture.pointerId)) {
+      this.container.releasePointerCapture?.(gesture.pointerId);
+    }
+    this.mobileScrollGesture = null;
+    return gesture.active;
+  }
+
+  private getTerminalCellHeight(): number {
+    const screen = this.container.querySelector<HTMLElement>('.xterm-screen');
+    if (!screen || this.terminal.rows < 1) return 0;
+    return screen.getBoundingClientRect().height / this.terminal.rows;
+  }
+
+  /** 将选中文字写入剪贴板，并按实际复制结果提供反馈。 */
+  private async copySelectionToClipboard(text: string): Promise<boolean> {
+    const copied = await copyTextToClipboard(text);
+    if (!copied) {
+      notify(t('terminal.copyFailed'), { variant: 'danger' });
+      return false;
+    }
+    notify(t('terminal.copySuccess'), { variant: 'success', duration: 1500 });
+    return true;
   }
 
   mount(): void {
@@ -297,6 +604,7 @@ export class SSHTerminal {
 
     this.terminal.open(this.container);
     this.mounted = true;
+    this.installIOSIMEFallback();
     
     // Load WebGL addon after terminal is opened
     try {
@@ -398,34 +706,119 @@ export class SSHTerminal {
 
   // ==================== known_hosts (TOFU) ====================
 
-  private handleHostKey(fingerprint: string): void {
-    if (!this.lastConfig) return;
-    const key = `${this.lastConfig.host}:${this.lastConfig.port}`;
-
-    // 存储到 localStorage（匿名用户）
+  private async handleVerifiedHostKey(message: unknown): Promise<void> {
+    const hostKey = normalizeVerifiedHostKeyMessage(message);
+    if (!hostKey) return;
+    const requireCloud = Boolean(this.lastHostInfo?.serverId);
     try {
-      const raw = localStorage.getItem('cloudssh_known_hosts');
-      const map = raw ? JSON.parse(raw) : {};
-      map[key] = fingerprint;
-      localStorage.setItem('cloudssh_known_hosts', JSON.stringify(map));
-    } catch { /* ignore */ }
+      await saveKnownFingerprint(
+        hostKey.host,
+        hostKey.port,
+        hostKey.fingerprint,
+        requireCloud,
+      );
+    } catch {
+      notify(t('terminal.hostKeySaveFailed'), {
+        title: t('terminal.hostKeySaveTitle'),
+        variant: 'danger',
+      });
+    }
+  }
 
-    // 尝试存储到云端（登录用户）
-    fetch('/api/known-hosts', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        host: this.lastConfig.host,
-        port: this.lastConfig.port,
-        fingerprint,
-      }),
-    }).catch(() => { /* 未登录或网络错误，忽略 */ });
+  private async handleChangedHostKey(socket: WebSocket, message: unknown): Promise<void> {
+    const hostKey = normalizeChangedHostKeyMessage(message);
+    if (!hostKey || this.pendingHostKeyChangeSocket) return;
+
+    this.canReconnect = false;
+    this.clearReconnectTimeout();
+    this.pendingHostKeyChangeSocket = socket;
+    try {
+      const trusted = await confirmAction({
+        title: t('terminal.hostKeyChangeTitle'),
+        message: t('terminal.hostKeyChangeMessage', {
+          host: hostKey.displayHost,
+          port: hostKey.port,
+          known: hostKey.expectedFingerprint,
+          actual: hostKey.fingerprint,
+          keyType: hostKey.keyType,
+        }),
+        confirmText: t('terminal.hostKeyTrustAndReconnect'),
+        cancelText: t('terminal.hostKeyCancel'),
+        variant: 'danger',
+      });
+      if (!trusted || socket !== this.ws) return;
+
+      const requireCloud = Boolean(this.lastHostInfo?.serverId);
+      try {
+        await saveKnownFingerprint(
+          hostKey.host,
+          hostKey.port,
+          hostKey.fingerprint,
+          requireCloud,
+        );
+      } catch {
+        notify(t('terminal.hostKeyTrustFailed'), {
+          title: t('terminal.hostKeyChangeTitle'),
+          variant: 'danger',
+        });
+        return;
+      }
+
+      try {
+        await this.reconnectAfterHostKeyTrust(hostKey);
+      } catch {
+        notify(t('terminal.hostKeyReconnectFailed'), {
+          title: t('terminal.hostKeyChangeTitle'),
+          variant: 'danger',
+        });
+      }
+    } finally {
+      if (this.pendingHostKeyChangeSocket === socket) {
+        this.pendingHostKeyChangeSocket = null;
+      }
+    }
+  }
+
+  private async reconnectAfterHostKeyTrust(hostKey: ChangedHostKeyMessage): Promise<void> {
+    this.reconnectAttempts = 0;
+    if (this.lastConfig) {
+      const config = { ...this.lastConfig, expectedFingerprint: hostKey.fingerprint };
+      this.terminal.writeln(`\x1b[32m[+] ${t('terminal.reconnecting')}\x1b[0m`);
+      await this.connect(config, { resetDisplay: false });
+      return;
+    }
+
+    const reconnectFactory = this.reconnectWebSocketFactory;
+    if (reconnectFactory) {
+      this.terminal.writeln(`\x1b[32m[+] ${t('terminal.reconnecting')}\x1b[0m`);
+      const socket = await reconnectFactory();
+      if (
+        this.reconnectWebSocketFactory !== reconnectFactory
+        || this.ws !== this.pendingHostKeyChangeSocket
+      ) {
+        socket.close(1000);
+        return;
+      }
+      this.connectWithWebSocket(socket, this.lastHostInfo ?? undefined, {
+        resetDisplay: false,
+        reconnectFactory,
+      });
+      return;
+    }
+
+    notify(t('terminal.hostKeyTrustedReconnectManually'), {
+      title: t('terminal.hostKeyChangeTitle'),
+      variant: 'warning',
+    });
   }
 
   async connect(config: SSHConnectionConfig, options: ConnectOptions = {}): Promise<void> {
     this.resetActiveConnection();
     this.lastConfig = config;
+    this.lastHostInfo = null;
+    this.reconnectWebSocketFactory = null;
     this.canReconnect = true;
+    this.sessionReady = false;
     if (options.resetDisplay !== false) {
       this.showConnectingBanner();
     }
@@ -443,12 +836,14 @@ export class SSHTerminal {
     }
 
     return new Promise((resolve, reject) => {
-      this.ws = new WebSocket(wsUrl.toString());
-      this.ws.binaryType = 'arraybuffer';
+      const socket = new WebSocket(wsUrl.toString());
+      this.ws = socket;
+      socket.binaryType = 'arraybuffer';
 
-      this.ws.onopen = () => {
+      socket.onopen = () => {
+        if (socket !== this.ws) return;
         this.terminal.writeln(`\x1b[32m[+] ${t('terminal.wsSendingCredentials')}\x1b[0m`);
-        this.ws?.send(JSON.stringify({
+        socket.send(JSON.stringify({
           host: config.host,
           port: config.port,
           username: config.username,
@@ -471,28 +866,38 @@ export class SSHTerminal {
     });
   }
 
-  connectWithWebSocket(ws: WebSocket, hostInfo?: { host: string; port: number }): void {
+  connectWithWebSocket(
+    ws: WebSocket,
+    hostInfo?: SSHHostInfo,
+    options: WebSocketConnectOptions = {},
+  ): void {
     this.resetActiveConnection();
-    this.lastConfig = hostInfo ? { host: hostInfo.host, port: hostInfo.port, username: '' } : null;
-    this.canReconnect = false;
+    this.lastConfig = null;
+    this.lastHostInfo = hostInfo ?? null;
+    this.reconnectWebSocketFactory = options.reconnectFactory ?? null;
+    this.canReconnect = Boolean(this.reconnectWebSocketFactory);
+    this.sessionReady = false;
     this.ws = ws;
     ws.binaryType = 'arraybuffer';
-    this.showConnectingBanner();
+    if (options.resetDisplay !== false) {
+      this.showConnectingBanner();
+    }
 
     const termStatus = document.getElementById('term-status');
     if (termStatus) termStatus.innerHTML = `<div class="w-2 h-2 bg-primary-container animate-pulse"></div> ${t('terminal.connecting')}`;
 
-    ws.onopen = () => {
+    const handleOpen = () => {
+      if (ws !== this.ws) return;
       this.terminal.writeln(`\x1b[32m[+] ${t('terminal.wsAuthenticating')}\x1b[0m`);
       this.sendResize();
       this.startHeartbeat();
     };
+    ws.onopen = handleOpen;
+    this.setupWebSocketHandlers();
 
     if (ws.readyState === WebSocket.OPEN) {
-      this.sendResize();
+      handleOpen();
     }
-
-    this.setupWebSocketHandlers();
   }
 
   private setupWebSocketHandlers(rejectFn?: (reason?: any) => void): void {
@@ -513,7 +918,7 @@ export class SSHTerminal {
         }
       },
       sendToServer: (data: string | Uint8Array) => {
-        if (this.ws?.readyState === WebSocket.OPEN) {
+        if (this.sessionReady && this.ws?.readyState === WebSocket.OPEN) {
           this.ws.send(data);
         }
       },
@@ -522,9 +927,24 @@ export class SSHTerminal {
     });
 
     this.ws.onmessage = (event) => {
+      if (socket !== this.ws) return;
       if (typeof event.data === 'string') {
+        let msg: any;
         try {
-          const msg = JSON.parse(event.data);
+          msg = JSON.parse(event.data);
+        } catch {
+          // Only parsing failures are terminal output. Exceptions raised by
+          // control-message handlers must never be swallowed as text.
+          this.trzszFilter!.processServerOutput(event.data);
+          return;
+        }
+
+        try {
+          if (msg.type === 'auth_challenge') {
+            this.handleAuthChallenge(socket, msg);
+            return;
+          }
+
           if (msg.type === 'sftp_attach') {
             this.sftpAttachUrl = msg.url || null;
             return;
@@ -539,39 +959,53 @@ export class SSHTerminal {
             case 'status':
               this.terminal.writeln(`\x1b[32m[*] ${localizedSSHMessage(msg.message, msg.event, msg.params)}\x1b[0m`);
               if (msg.event === 'auth_success' || msg.message === '认证成功') {
-                this.reconnectAttempts = 0;
-                const statusText = document.getElementById('status-text');
-                if (statusText) statusText.innerHTML = `<span class="w-2 h-2 bg-[var(--accent)] inline-block animate-pulse"></span> ${t('auth.statusOnline')}`;
+                this.authChallengeDialog?.dismiss();
               }
               if (msg.event === 'shell_ready' || msg.message === 'Shell 已就绪') {
+                this.sessionReady = true;
+                this.reconnectAttempts = 0;
                 this.onSessionReady?.();
               }
               break;
             case 'error':
+              if (NON_RETRIABLE_AUTH_EVENTS.has(msg.event)) {
+                this.canReconnect = false;
+                this.clearReconnectTimeout();
+                this.authChallengeDialog?.dismiss();
+              }
               this.terminal.writeln(`\x1b[31m[!] ${localizedSSHMessage(msg.message, msg.event, msg.params)}\x1b[0m`);
               break;
             case 'debug':
               this.terminal.writeln(`\x1b[90m[DEBUG] ${msg.message}\x1b[0m`);
               break;
-            case 'host_key':
-              this.handleHostKey(msg.fingerprint);
+            case 'host_key_verified':
+              void this.handleVerifiedHostKey(msg);
+              break;
+            case 'host_key_changed':
+              void this.handleChangedHostKey(socket, msg).catch(() => {
+                notify(t('terminal.hostKeyTrustFailed'), {
+                  title: t('terminal.hostKeyChangeTitle'),
+                  variant: 'danger',
+                });
+              });
               break;
             case 'pong':
-              if (this.lastPingTime !== null) {
-                this.wsLatency = Math.round(performance.now() - this.lastPingTime);
-                this.lastPingTime = null;
-                this.onLatencyUpdated?.(this.cfLatency, this.cfColo, this.wsLatency);
-              }
+              this.handleHeartbeatResponse(msg);
               break;
             case 'rtt':
               this.cfLatency = msg.latency;
               this.cfColo = msg.colo;
               this.onLatencyUpdated?.(this.cfLatency, this.cfColo, this.wsLatency);
               break;
+            case 'os_detected':
+              this.onOSDetectedHandler?.(msg.serverId, msg.os);
+              return;
           }
-        } catch {
-          // Non-JSON string data — pass through trzsz filter
-          this.trzszFilter!.processServerOutput(event.data);
+        } catch (error) {
+          console.error('WebSocket control message handling failed', error);
+          if (msg?.type === 'auth_challenge') {
+            this.rejectAuthChallenge(socket, msg);
+          }
         }
       } else {
         this.trzszFilter!.processServerOutput(event.data);
@@ -581,7 +1015,9 @@ export class SSHTerminal {
     this.ws.onclose = (event) => {
       if (socket !== this.ws) return;
 
+      this.authChallengeDialog?.dismiss();
       this.stopHeartbeat();
+      this.sessionReady = false;
       this.terminal.writeln(
         `\x1b[33m[*] ${t('terminal.connectionClosed', { code: event.code })}\x1b[0m`
       );
@@ -590,17 +1026,15 @@ export class SSHTerminal {
       const statusText = document.getElementById('status-text');
       if (statusText) statusText.innerHTML = `<span class="w-2 h-2 bg-surface-dot inline-block"></span> ${t('auth.statusOffline')}`;
       
-      if (event.code === 1000) {
-        this.onSessionClosed?.(event);
-        return;
-      }
-
-      if (this.canReconnect && this.lastConfig && this.reconnectAttempts < this.maxReconnectAttempts) {
+      const willReconnect = event.code !== 1000 && this.hasReconnectStrategy();
+      this.onSessionClosed?.(event, willReconnect);
+      if (willReconnect) {
         this.scheduleReconnect();
       }
     };
 
     this.ws.onerror = () => {
+      if (socket === this.ws) this.authChallengeDialog?.dismiss();
       this.terminal.writeln(`\x1b[31m[!] ${t('terminal.connectionError')}\x1b[0m`);
       if (rejectFn) rejectFn(new Error(t('terminal.wsFailed')));
     };
@@ -608,14 +1042,17 @@ export class SSHTerminal {
     // User input goes through trzsz filter
     this.disposables.push(
       this.terminal.onData((data) => {
-        this.trzszFilter!.processTerminalInput(data);
+        if (this.imePendingBaseline !== null && data) {
+          this.imePendingHandled = true;
+        }
+        this.processTerminalInput(data);
       })
     );
 
     // Binary input support
     this.disposables.push(
       this.terminal.onBinary((data) => {
-        this.trzszFilter!.processBinaryInput(data);
+        if (this.sessionReady) this.trzszFilter!.processBinaryInput(data);
       })
     );
 
@@ -628,20 +1065,247 @@ export class SSHTerminal {
     );
   }
 
-  fit(): void {
+  private handleAuthChallenge(socket: WebSocket, payload: unknown): void {
+    if (socket !== this.ws) return;
+
+    const challengeTarget = typeof payload === 'object' && payload !== null
+      ? payload as { host?: unknown; port?: unknown }
+      : {};
+    const challengeHost = typeof challengeTarget.host === 'string'
+      ? challengeTarget.host
+      : this.lastConfig?.host ?? '';
+    const challengePort = typeof challengeTarget.port === 'number' && Number.isInteger(challengeTarget.port)
+      ? challengeTarget.port
+      : this.lastConfig?.port ?? 22;
+
+    this.authChallengeDialog ??= new AuthChallengeDialog();
+    const shown = this.authChallengeDialog.show(payload, {
+      host: challengeHost,
+      port: challengePort,
+      onShown: (id: string) => {
+        if (socket !== this.ws || socket.readyState !== WebSocket.OPEN) return;
+        socket.send(JSON.stringify({ type: 'auth_challenge_ack', id }));
+      },
+      onSubmit: (submission: AuthChallengeSubmission) => {
+        // The callback belongs to the socket that produced this challenge. A
+        // reconnect must never receive a stale password or one-time code.
+        if (socket !== this.ws || socket.readyState !== WebSocket.OPEN) return;
+        socket.send(JSON.stringify(submission));
+      },
+      onCancel: (id: string) => {
+        if (socket !== this.ws) return;
+        this.canReconnect = false;
+        this.clearReconnectTimeout();
+        if (socket.readyState === WebSocket.OPEN) {
+          socket.send(JSON.stringify({ type: 'auth_cancel', id }));
+        }
+      },
+    });
+
+    if (!shown) {
+      this.rejectAuthChallenge(socket, payload);
+    }
+  }
+
+  private rejectAuthChallenge(socket: WebSocket, payload: unknown): void {
+    if (socket !== this.ws) return;
+    this.canReconnect = false;
+    this.clearReconnectTimeout();
+    this.authChallengeDialog?.dismiss();
+    this.terminal.writeln(`\x1b[31m[!] ${t('authChallenge.invalid')}\x1b[0m`);
+    if (socket.readyState !== WebSocket.OPEN) return;
+
+    const id = typeof payload === 'object' && payload !== null
+      && typeof (payload as { id?: unknown }).id === 'string'
+      ? (payload as { id: string }).id
+      : null;
+    if (id) {
+      socket.send(JSON.stringify({ type: 'auth_cancel', id }));
+    } else {
+      socket.close(1000, 'Invalid authentication challenge');
+    }
+  }
+
+  fit(): boolean {
+    const fontSize = currentTerminalFontSize();
+    if (this.terminal.options.fontSize !== fontSize) {
+      this.terminal.options.fontSize = fontSize;
+    }
+    if (!this.mounted || this.container.clientWidth === 0 || this.container.clientHeight === 0) return false;
+    const dimensions = this.fitAddon.proposeDimensions();
+    if (!dimensions
+      || (dimensions.cols === this.terminal.cols && dimensions.rows === this.terminal.rows)) return false;
+
+    const buffer = this.terminal.buffer.active;
+    const bufferType = buffer.type;
+    const wasAtBottom = buffer.viewportY >= buffer.baseY;
+    const distanceFromBottom = Math.max(0, buffer.baseY - buffer.viewportY);
     this.fitAddon.fit();
+    const restoreViewport = () => {
+      const resizedBuffer = this.terminal.buffer.active;
+      if (resizedBuffer.type !== bufferType) return;
+      if (wasAtBottom) {
+        this.terminal.scrollToBottom();
+      } else {
+        this.terminal.scrollToLine(Math.max(0, resizedBuffer.baseY - distanceFromBottom));
+      }
+    };
+    restoreViewport();
+    if (this.viewportRestoreFrame !== null) cancelAnimationFrame(this.viewportRestoreFrame);
+    this.viewportRestoreFrame = requestAnimationFrame(() => {
+      this.viewportRestoreFrame = null;
+      // xterm 的自定义滚动视口会在 resize 后下一帧同步 scrollHeight，
+      // 再恢复一次可避免初次恢复被旧的滚动范围截断。
+      restoreViewport();
+    });
+    return true;
+  }
+
+  private processTerminalInput(data: string): void {
+    if (!this.sessionReady || !this.trzszFilter) return;
+    const transformed = applyMobileModifier(data, this.mobileModifier);
+    if (transformed.consumed) this.setMobileModifier(null);
+    this.trzszFilter.processTerminalInput(transformed.data);
+  }
+
+  /**
+   * xterm.js 6.0 尚未包含上游 keyCode=229 keyup 修复。这里只在 iOS-like
+   * 环境补发 xterm 未观察到的 textarea 差异；若 xterm 已产生 onData 则不重复发送。
+   */
+  private installIOSIMEFallback(): void {
+    if (this.imeTextarea) return;
+    const textarea = this.container.querySelector<HTMLTextAreaElement>('.xterm-helper-textarea');
+    if (!textarea) return;
+    this.imeTextarea = textarea;
+    textarea.setAttribute('enterkeyhint', 'enter');
+    textarea.setAttribute('autocapitalize', 'off');
+    textarea.setAttribute('autocomplete', 'off');
+    textarea.setAttribute('autocorrect', 'off');
+    textarea.spellcheck = false;
+    if (!isIOSLike(navigator)) return;
+    textarea.addEventListener('keydown', this.imeKeydownListener, true);
+    textarea.addEventListener('keyup', this.imeKeyupListener, true);
+    textarea.addEventListener('compositionstart', this.imeCompositionStartListener, true);
+  }
+
+  private readonly imeKeydownListener = (event: KeyboardEvent): void => {
+    if (event.keyCode !== 229 || !this.imeTextarea) return;
+    if (this.imePendingBaseline === null) {
+      this.imePendingBaseline = this.imeTextarea.value;
+      this.imePendingHandled = false;
+    }
+  };
+
+  private readonly imeKeyupListener = (_event: KeyboardEvent): void => {
+    // iOS 中文输入法只保证 keydown 使用 229；对应 keyup 可能是空格的 32、
+    // 标点的 0，或其他实际键码。只要存在待处理的 229 周期就应检查差异。
+    if (this.imePendingBaseline === null) return;
+    if (this.imeKeyupTimer !== null) clearTimeout(this.imeKeyupTimer);
+    // 让 xterm 自己在 keyup 或先前的 0ms fallback 中优先消费输入。
+    this.imeKeyupTimer = setTimeout(() => {
+      this.imeKeyupTimer = null;
+      if (!this.imePendingHandled && this.imeTextarea && this.imePendingBaseline !== null) {
+        const diff = diffTextareaInput(this.imePendingBaseline, this.imeTextarea.value);
+        if (diff) this.sendInput(diff);
+      }
+      this.clearIMEPendingInput();
+    }, 0);
+  };
+
+  private readonly imeCompositionStartListener = (): void => {
+    this.clearIMEPendingInput();
+  };
+
+  private clearIMEPendingInput(): void {
+    if (this.imeKeyupTimer !== null) {
+      clearTimeout(this.imeKeyupTimer);
+      this.imeKeyupTimer = null;
+    }
+    this.imePendingBaseline = null;
+    this.imePendingHandled = false;
   }
 
   private startHeartbeat(): void {
     this.stopHeartbeat();
-    const sendPing = () => {
-      if (this.ws?.readyState === WebSocket.OPEN) {
-        this.lastPingTime = performance.now();
-        this.ws.send(JSON.stringify({ type: 'ping' }));
+    if (document.visibilityState === 'hidden') return;
+    this.sendHeartbeatProbe();
+    this.heartbeatInterval = setInterval(
+      () => this.sendHeartbeatProbe(),
+      RTT_HEARTBEAT_INTERVAL_MS,
+    );
+  }
+
+  private sendHeartbeatProbe(): void {
+    const socket = this.ws;
+    if (
+      document.visibilityState === 'hidden'
+      || socket?.readyState !== WebSocket.OPEN
+      || this.pendingHeartbeatId !== null
+    ) return;
+
+    const id = crypto.randomUUID();
+    this.pendingHeartbeatId = id;
+    this.lastPingTime = performance.now();
+    socket.send(JSON.stringify({ type: 'ping', id }));
+    this.heartbeatResponseTimeout = setTimeout(() => {
+      if (socket !== this.ws || this.pendingHeartbeatId !== id) return;
+      this.pendingHeartbeatId = null;
+      this.heartbeatResponseTimeout = null;
+      this.lastPingTime = null;
+      if (document.visibilityState === 'hidden') return;
+      this.recoverUnresponsiveConnection(socket);
+    }, HEARTBEAT_RESPONSE_TIMEOUT_MS);
+  }
+
+  private handleHeartbeatResponse(message: { id?: unknown }): void {
+    if (this.pendingHeartbeatId === null || this.lastPingTime === null) return;
+    // 新后端会回传探测 ID；保留对尚未升级后端无 ID pong 的兼容。
+    if (typeof message.id === 'string' && message.id !== this.pendingHeartbeatId) return;
+    if (this.heartbeatResponseTimeout) {
+      clearTimeout(this.heartbeatResponseTimeout);
+      this.heartbeatResponseTimeout = null;
+    }
+    this.pendingHeartbeatId = null;
+    this.wsLatency = Math.round(performance.now() - this.lastPingTime);
+    this.lastPingTime = null;
+    this.onLatencyUpdated?.(this.cfLatency, this.cfColo, this.wsLatency);
+  }
+
+  private verifyConnectionAfterResume(): void {
+    const returnedFromBackground = this.pageHiddenAt !== null;
+    this.pageHiddenAt = null;
+    const socket = this.ws;
+    if (!socket) return;
+
+    if (socket.readyState === WebSocket.OPEN) {
+      if (returnedFromBackground) {
+        this.terminal.writeln(`\x1b[33m[*] ${t('terminal.resumeChecking')}\x1b[0m`);
       }
-    };
-    sendPing();
-    this.heartbeatInterval = setInterval(sendPing, 30000);
+      this.startHeartbeat();
+      return;
+    }
+
+    if (
+      socket.readyState === WebSocket.CLOSED
+      && this.hasReconnectStrategy()
+      && this.reconnectTimeout === null
+    ) {
+      this.scheduleReconnect();
+    }
+  }
+
+  private recoverUnresponsiveConnection(socket: WebSocket): void {
+    if (socket !== this.ws) return;
+    this.terminal.writeln(`\x1b[31m[!] ${t('terminal.resumeStale')}\x1b[0m`);
+    const event = new CloseEvent('close', {
+      code: 4000,
+      reason: 'Heartbeat timeout',
+      wasClean: false,
+    });
+    const willReconnect = this.hasReconnectStrategy();
+    this.onSessionClosed?.(event, willReconnect);
+    this.resetActiveConnection();
+    if (willReconnect) this.scheduleReconnect();
   }
 
   private getTerminalSize(): { cols: number; rows: number } {
@@ -700,6 +1364,12 @@ export class SSHTerminal {
       clearInterval(this.heartbeatInterval);
       this.heartbeatInterval = null;
     }
+    if (this.heartbeatResponseTimeout) {
+      clearTimeout(this.heartbeatResponseTimeout);
+      this.heartbeatResponseTimeout = null;
+    }
+    this.pendingHeartbeatId = null;
+    this.lastPingTime = null;
   }
 
   private disposeConnectionDisposables(): void {
@@ -715,6 +1385,7 @@ export class SSHTerminal {
   }
 
   private resetActiveConnection(): void {
+    this.authChallengeDialog?.dismiss();
     this.stopHeartbeat();
     this.clearReconnectTimeout();
     this.disposeConnectionDisposables();
@@ -723,15 +1394,21 @@ export class SSHTerminal {
     this.ws = null;
     this.sftpAttachUrl = null;
     this.trzszFilter = null;
+    this.sessionReady = false;
 
     this.cfLatency = null;
     this.cfColo = null;
-    this.lastPingTime = null;
     this.wsLatency = null;
 
     if (socket && socket.readyState !== WebSocket.CLOSED && socket.readyState !== WebSocket.CLOSING) {
       socket.close(1000);
     }
+  }
+
+  private hasReconnectStrategy(): boolean {
+    return this.canReconnect
+      && this.reconnectAttempts < this.maxReconnectAttempts
+      && Boolean(this.lastConfig || this.reconnectWebSocketFactory);
   }
 
   private scheduleReconnect(): void {
@@ -751,20 +1428,66 @@ export class SSHTerminal {
         } catch (e) {
           this.terminal.writeln(`\x1b[31m[!] ${t('terminal.reconnectFailed')}\x1b[0m`);
         }
+      } else if (this.reconnectWebSocketFactory) {
+        this.terminal.writeln(`\x1b[32m[+] ${t('terminal.reconnecting')}\x1b[0m`);
+        const reconnectFactory = this.reconnectWebSocketFactory;
+        try {
+          const socket = await reconnectFactory();
+          // 用户可能在令牌请求期间主动关闭标签或发起另一条连接。
+          // 这时丢弃迟到的 socket，避免页面被已经取消的重连重新拉起。
+          if (
+            this.reconnectWebSocketFactory !== reconnectFactory
+            || !this.canReconnect
+            || this.reconnectAttempts >= this.maxReconnectAttempts
+          ) {
+            socket.close(1000);
+            return;
+          }
+          this.connectWithWebSocket(socket, this.lastHostInfo ?? undefined, {
+            resetDisplay: false,
+            reconnectFactory,
+          });
+        } catch {
+          this.terminal.writeln(`\x1b[31m[!] ${t('terminal.reconnectFailed')}\x1b[0m`);
+          if (this.hasReconnectStrategy()) this.scheduleReconnect();
+        }
       }
     }, delay);
   }
 
   disconnect(): void {
     this.reconnectAttempts = this.maxReconnectAttempts;
+    this.setMobileSelectionMode(false);
     this.resetActiveConnection();
     this.lastConfig = null;
+    this.lastHostInfo = null;
+    this.reconnectWebSocketFactory = null;
     this.resetTerminalDisplay();
   }
 
   dispose(): void {
     this.disconnect();
+    this.authChallengeDialog?.destroy();
+    this.authChallengeDialog = null;
     window.removeEventListener('resize', this.resizeListener);
+    if (this.mobileConnectionRecoveryEnabled) {
+      document.removeEventListener('visibilitychange', this.visibilityChangeListener);
+      window.removeEventListener('pageshow', this.pageShowListener);
+    }
+    window.removeEventListener('online', this.onlineListener);
+    this.container.removeEventListener('pointerdown', this.selectionPointerDownListener, true);
+    this.container.removeEventListener('pointermove', this.selectionPointerMoveListener, true);
+    window.removeEventListener('pointerup', this.selectionPointerUpListener, true);
+    window.removeEventListener('pointercancel', this.selectionPointerCancelListener, true);
+    this.container.removeEventListener('contextmenu', this.contextMenuPasteListener);
+    this.imeTextarea?.removeEventListener('keydown', this.imeKeydownListener, true);
+    this.imeTextarea?.removeEventListener('keyup', this.imeKeyupListener, true);
+    this.imeTextarea?.removeEventListener('compositionstart', this.imeCompositionStartListener, true);
+    this.clearIMEPendingInput();
+    if (this.viewportRestoreFrame !== null) cancelAnimationFrame(this.viewportRestoreFrame);
+    this.viewportRestoreFrame = null;
+    this.imeTextarea = null;
+    this.themeCleanup();
     this.terminalDisposables.forEach(d => d.dispose());
     this.terminalDisposables = [];
     this.terminal.dispose();
@@ -800,56 +1523,4 @@ export class SSHTerminal {
     document.body.removeChild(a);
     URL.revokeObjectURL(url);
   }
-}
-
-// ==================== known_hosts 辅助函数 ====================
-
-/**
- * 加载已知主机指纹（TOFU 验证用）
- * 优先从云端（登录用户）加载，回退到 localStorage（匿名用户）
- */
-export async function loadKnownFingerprint(host: string, port: number): Promise<string | null> {
-  // 先尝试云端（登录用户）
-  try {
-    const res = await fetch(`/api/known-hosts?host=${encodeURIComponent(host)}&port=${port}`);
-    if (res.ok) {
-      const data = await res.json() as { fingerprint: string | null };
-      if (data.fingerprint) return data.fingerprint;
-    }
-  } catch { /* 未登录或网络错误 */ }
-
-  // 回退到 localStorage
-  try {
-    const raw = localStorage.getItem('cloudssh_known_hosts');
-    if (raw) {
-      const map = JSON.parse(raw) as Record<string, string>;
-      return map[`${host}:${port}`] || null;
-    }
-  } catch { /* ignore */ }
-
-  return null;
-}
-
-/**
- * 清除已知主机指纹（用于主机密钥变更后重新信任）
- */
-export async function clearKnownFingerprint(host: string, port: number): Promise<void> {
-  // 清除 localStorage
-  try {
-    const raw = localStorage.getItem('cloudssh_known_hosts');
-    if (raw) {
-      const map = JSON.parse(raw) as Record<string, string>;
-      delete map[`${host}:${port}`];
-      localStorage.setItem('cloudssh_known_hosts', JSON.stringify(map));
-    }
-  } catch { /* ignore */ }
-
-  // 清除云端
-  try {
-    await fetch('/api/known-hosts', {
-      method: 'DELETE',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ host, port }),
-    });
-  } catch { /* 未登录或网络错误 */ }
 }

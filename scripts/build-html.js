@@ -1,6 +1,6 @@
 const fs = require('fs');
 const path = require('path');
-const { execSync } = require('child_process');
+const { execFileSync } = require('child_process');
 
 const rootDir = path.resolve(__dirname, '..');
 const frontendDir = path.join(rootDir, 'frontend');
@@ -8,11 +8,21 @@ const distDir = path.join(frontendDir, 'dist');
 const workerDir = path.join(rootDir, 'src', 'worker');
 const htmlTsFile = path.join(workerDir, 'html.ts');
 
+function inlineRequiredAsset(html, patterns, replacement, assetType) {
+  for (const pattern of patterns) {
+    if (pattern.test(html)) {
+      return html.replace(pattern, replacement);
+    }
+  }
+  throw new Error(`Unable to find the ${assetType} reference in the generated frontend HTML.`);
+}
+
 console.log('Building frontend...');
 try {
-  // 1. Install and build frontend
-  execSync('npx pnpm install', { cwd: frontendDir, stdio: 'inherit' });
-  execSync('npx pnpm run build', { cwd: frontendDir, stdio: 'inherit' });
+  execFileSync(process.execPath, ['scripts/sync-theme-editor.js'], { cwd: rootDir, stdio: 'inherit' });
+  // Dependencies are installed explicitly by developers/CI. Keeping installs out
+  // of the build makes production artifacts deterministic and offline-buildable.
+  execFileSync('pnpm', ['run', 'build'], { cwd: frontendDir, stdio: 'inherit' });
 
   console.log('Inlining assets...');
   // 2. Read dist/index.html
@@ -20,19 +30,18 @@ try {
 
   // 3. Find assets in dist/assets
   const assetsDir = path.join(distDir, 'assets');
-  const files = fs.readdirSync(assetsDir);
+  const files = fs.readdirSync(assetsDir).sort();
+  const jsFiles = files.filter((file) => file.endsWith('.js'));
+  const cssFiles = files.filter((file) => file.endsWith('.css'));
 
-  let jsContent = '';
-  let cssContent = '';
-
-  for (const file of files) {
-    const filePath = path.join(assetsDir, file);
-    if (file.endsWith('.js')) {
-      jsContent = fs.readFileSync(filePath, 'utf8');
-    } else if (file.endsWith('.css')) {
-      cssContent = fs.readFileSync(filePath, 'utf8');
-    }
+  if (jsFiles.length !== 1 || cssFiles.length !== 1) {
+    throw new Error(
+      `Expected exactly one JS and one CSS bundle for Worker inlining, got ${jsFiles.length} JS and ${cssFiles.length} CSS.`
+    );
   }
+
+  const jsContent = fs.readFileSync(path.join(assetsDir, jsFiles[0]), 'utf8');
+  const cssContent = fs.readFileSync(path.join(assetsDir, cssFiles[0]), 'utf8');
 
   // 4. Inline favicon.svg as base64 data URL
   const faviconPath = path.join(frontendDir, 'public', 'favicon.svg');
@@ -46,12 +55,16 @@ try {
   }
 
   // 5. Inline CSS (replace <link rel="stylesheet" ...>)
-  html = html.replace(/<link[^>]*rel=["']stylesheet["'][^>]*href=["']\/assets\/[^"']+["'][^>]*>/i, () => `<style>${cssContent}</style>`);
-  html = html.replace(/<link[^>]*rel=["']stylesheet["'][^>]*href=["']\/src\/[^"']+["'][^>]*>/i, () => `<style>${cssContent}</style>`);
+  html = inlineRequiredAsset(html, [
+    /<link[^>]*rel=["']stylesheet["'][^>]*href=["']\/assets\/[^"']+["'][^>]*>/i,
+    /<link[^>]*rel=["']stylesheet["'][^>]*href=["']\/src\/[^"']+["'][^>]*>/i,
+  ], () => `<style>${cssContent}</style>`, 'stylesheet');
 
   // 6. Inline JS (replace <script type="module" src="/src/main.ts"></script> or similar)
-  html = html.replace(/<script[^>]*type=["']module["'][^>]*src=["']\/assets\/[^"']+["'][^>]*><\/script>/i, () => `<script type="module">${jsContent}</script>`);
-  html = html.replace(/<script[^>]*type=["']module["'][^>]*src=["']\/src\/[^"']+["'][^>]*><\/script>/i, () => `<script type="module">${jsContent}</script>`);
+  html = inlineRequiredAsset(html, [
+    /<script[^>]*type=["']module["'][^>]*src=["']\/assets\/[^"']+["'][^>]*><\/script>/i,
+    /<script[^>]*type=["']module["'][^>]*src=["']\/src\/[^"']+["'][^>]*><\/script>/i,
+  ], () => `<script type="module">${jsContent}</script>`, 'module script');
 
   // 7. Write to src/worker/html.ts
   const escapedHtml = html

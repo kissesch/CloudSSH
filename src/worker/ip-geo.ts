@@ -3,10 +3,11 @@ import { ALLOWED_LOCATION_HINTS } from '../types';
 /**
  * 自动推断 SSH 目标服务器对应的 Cloudflare DO locationHint。
  *
- * 该函数仅在 **保存服务器** 时被调用一次，结果持久化入 `servers.inferred_hint` 列；
- * 后续连接时直接读 DB，**不再运行时查询 ipapi.co**，零延迟、零外部依赖。
+ * 该函数仅在保存或修改 **Cloudflare 直接连接的跳板链入口** 时调用，
+ * 结果持久化入 `servers.inferred_hint` 列；配置了跳板的下游节点不会查询 IPinfo。
+ * 后续连接时直接读 DB，**不再运行时查询 IPinfo**，不增加连接阶段的外部查询延迟。
  *
- * fetch 带 `cf.cacheEverything + cacheTtl` 让 Cloudflare 边缘缓存 ipapi 响应 24h，
+ * fetch 带 `cf.cacheEverything + cacheTtl` 让 Cloudflare 边缘缓存 IPinfo 响应 24h，
  * 同 colo 内对同 host 的重复保存（如编辑时）只打一次源 API。
  * 失败时返回 undefined（连接时退化为无 hint = Auto = Cloudflare 默认调度）。
  */
@@ -54,6 +55,7 @@ function refineForUsCanada(country: string, lon: number): string {
 }
 
 const ALLOWED_SET: ReadonlySet<string> = new Set(ALLOWED_LOCATION_HINTS);
+const IPINFO_TIMEOUT_MS = 3000;
 
 /**
  * 推断结果，包含 hint 和调试信息
@@ -66,7 +68,7 @@ export interface InferResult {
 /**
  * 推断 host 对应的 Cloudflare DO locationHint。
  *
- * @param host SSH 服务器的主机名或 IP（IPv4/IPv6/域名均可，ipapi.co 自行解析）
+ * @param host SSH 服务器的主机名或 IP（该值会发送到第三方 IPinfo 服务进行查询）
  * @returns InferResult 包含 hint 和调试日志
  */
 export async function inferLocationHint(host: string): Promise<InferResult> {
@@ -79,11 +81,12 @@ export async function inferLocationHint(host: string): Promise<InferResult> {
   }
 
   try {
-    // 使用 ipinfo.io（免费 50k/月，比 ipapi.co 的 1k/天更宽松）
+    // 使用第三方 IPinfo 查询目标主机的地理信息
     const url = `https://ipinfo.io/${encodeURIComponent(host)}/json`;
     debug.push(`[IP-GEO] 请求 ipinfo.io: ${url}`);
     const res = await fetch(url, {
       cf: { cacheTtl: 86400, cacheEverything: true }, // CF 边缘缓存 24h
+      signal: AbortSignal.timeout(IPINFO_TIMEOUT_MS),
     });
     debug.push(`[IP-GEO] ipinfo.io 响应状态: ${res.status}, CF-Cache-Status: ${res.headers.get('cf-cache-status') || 'N/A'}`);
 

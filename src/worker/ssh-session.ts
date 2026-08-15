@@ -8,6 +8,7 @@ import {
   SSH_MSG_EXT_INFO,
   SSH_MSG_USERAUTH_SUCCESS,
   SSH_MSG_USERAUTH_FAILURE,
+  SSH_MSG_USERAUTH_INFO_REQUEST,
   SSH_MSG_GLOBAL_REQUEST,
   SSH_MSG_REQUEST_FAILURE,
   SSH_MSG_REQUEST_SUCCESS,
@@ -49,13 +50,35 @@ import { SSHAESCTRCipher, SSHAESGCMCipher, SSHHMAC } from '../ssh/crypto';
 import { SSHAuth } from '../ssh/auth';
 import { SSHChannel, type ChannelDataChunk } from '../ssh/channel';
 import { SFTPHandler } from './sftp-handler';
+import { DETECT_OS_COMMAND, isDetectedOS, parseDetectedOS } from './os-detect';
 import { AgentCore } from './agent/core';
 import { TerminalContext } from './agent/terminal-context';
 import { AgentExecChannel } from './agent/exec-channel';
+import { DirectTcpipStream } from './direct-tcpip-stream';
 import type { Env } from '../types';
 
 const LOCAL_WINDOW_ADJUST_THRESHOLD = 512 * 1024;
 const KEEPALIVE_REQUEST_NAME = new TextEncoder().encode('keepalive@openssh.com');
+const AUTH_CHALLENGE_ACK_TIMEOUT_MS = 10 * 1000;
+const AUTH_CHALLENGE_RESPONSE_TIMEOUT_MS = 2 * 60 * 1000;
+const MAX_KEYBOARD_INTERACTIVE_ROUNDS = 8;
+const MAX_PARTIAL_AUTHENTICATION_STAGES = 8;
+
+type ActiveAuthMethod = 'none' | 'password' | 'publickey' | 'keyboard-interactive';
+
+interface PendingAuthChallenge {
+  id: string;
+  prompts: Array<{ text: string; echo: boolean }>;
+  phase: 'awaiting_ack' | 'awaiting_response';
+  timeout: ReturnType<typeof setTimeout>;
+}
+
+export interface SSHSessionOptions {
+  /** Tunnel hops authenticate without allocating a PTY, Shell, SFTP, or Agent. */
+  openShellOnAuth?: boolean;
+  /** Only the final nested session owns the browser WebSocket lifecycle. */
+  ownsWebSocket?: boolean;
+}
 
 export class SSHSession {
   private readonly textEncoder = new TextEncoder();
@@ -103,7 +126,14 @@ export class SSHSession {
    */
   private serverSigAlgs: string[] = [];
 
-  private state: 'connecting' | 'version' | 'kex' | 'auth' | 'shell' | 'shell-requested' | 'ready'
+  /** 当前认证方式用于区分 msg 60 在 publickey/password/RFC 4256 中的不同语义。 */
+  private activeAuthMethod: ActiveAuthMethod | null = null;
+  private attemptedAuthMethods: Set<ActiveAuthMethod> = new Set();
+  private keyboardInteractiveRounds: number = 0;
+  private partialAuthenticationStages: number = 0;
+  private pendingAuthChallenge: PendingAuthChallenge | null = null;
+
+  private state: 'connecting' | 'version' | 'kex' | 'auth' | 'tunnel-ready' | 'shell' | 'shell-requested' | 'ready'
     = 'connecting';
   private hostKeyFingerprint: string = '';
   private hostKeyType: string = 'unknown';
@@ -127,10 +157,25 @@ export class SSHSession {
   private terminalContext: TerminalContext = new TerminalContext();
   private agentCore: AgentCore | null = null;
   private activeExecChannels: Map<number, AgentExecChannel> = new Map();
+  private directTcpipStreams: Map<number, DirectTcpipStream> = new Map();
+  private pendingDirectTcpip: Map<number, {
+    resolve: (stream: DirectTcpipStream) => void;
+    reject: (error: Error) => void;
+    timeout: ReturnType<typeof setTimeout>;
+  }> = new Map();
+  private channelWindowWaiters: Map<number, Array<() => void>> = new Map();
   private confirmationResolve: ((approved: boolean) => void) | null = null;
   private env: Env | null = null;
   private userId: string | null = null;
   private githubId: string | null = null;
+  private osDetectInProgress: boolean = false;
+  private readonly openShellOnAuth: boolean;
+  private readonly ownsWebSocket: boolean;
+  private authenticatedResolve!: () => void;
+  private authenticatedReject!: (error: Error) => void;
+  private readonly authenticatedPromise: Promise<void>;
+  private authenticatedSettled = false;
+  private closed = false;
 
   constructor(
     ws: WebSocket,
@@ -142,6 +187,7 @@ export class SSHSession {
     env?: Env,
     userId?: string,
     githubId?: string,
+    options: SSHSessionOptions = {},
   ) {
     this.ws = ws;
     this.socket = socket;
@@ -152,6 +198,13 @@ export class SSHSession {
     this.env = env || null;
     this.userId = userId || null;
     this.githubId = githubId || null;
+    this.openShellOnAuth = options.openShellOnAuth !== false;
+    this.ownsWebSocket = options.ownsWebSocket !== false;
+    this.authenticatedPromise = new Promise<void>((resolve, reject) => {
+      this.authenticatedResolve = resolve;
+      this.authenticatedReject = reject;
+    });
+    void this.authenticatedPromise.catch(() => {});
 
     this.transport = new SSHTransport();
     this.packetParser = new SSHPacketParser();
@@ -168,6 +221,55 @@ export class SSHSession {
     await this.writeSocket(this.textEncoder.encode('SSH-2.0-CloudSSH_1.0\r\n'));
 
     this.startReading();
+  }
+
+  waitUntilAuthenticated(): Promise<void> {
+    return this.authenticatedPromise;
+  }
+
+  /** Open an RFC 4254 direct-tcpip byte stream through an authenticated hop. */
+  async openDirectTcpip(host: string, port: number): Promise<DirectTcpipStream> {
+    if (this.state !== 'tunnel-ready') {
+      throw new Error('SSH jump host is not ready for TCP forwarding');
+    }
+    if (!host || !Number.isInteger(port) || port < 1 || port > 65535) {
+      throw new Error('Invalid direct-tcpip destination');
+    }
+
+    const channelID = this.nextChannelID++;
+    const channel = new SSHChannel();
+    this.channels.set(channelID, channel);
+
+    const stream = new DirectTcpipStream(
+      (data) => this.sendDirectTcpipData(channelID, channel, data),
+      () => this.closeDirectTcpipChannel(channelID, channel),
+      (bytes) => this.queueLocalWindowAdjust(bytes, channel),
+    );
+    this.directTcpipStreams.set(channelID, stream);
+
+    const opened = new Promise<DirectTcpipStream>((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        this.pendingDirectTcpip.delete(channelID);
+        this.directTcpipStreams.delete(channelID);
+        this.channels.delete(channelID);
+        stream.remoteClose(new Error('direct-tcpip channel open timed out'));
+        reject(new Error('跳板服务器建立目标转发通道超时'));
+      }, 15_000);
+      this.pendingDirectTcpip.set(channelID, { resolve, reject, timeout });
+    });
+
+    try {
+      await this.sendEncrypted(channel.buildOpenDirectTcpip(channelID, host, port));
+    } catch (error) {
+      const pending = this.pendingDirectTcpip.get(channelID);
+      if (pending) clearTimeout(pending.timeout);
+      this.pendingDirectTcpip.delete(channelID);
+      this.directTcpipStreams.delete(channelID);
+      this.channels.delete(channelID);
+      stream.remoteClose(error instanceof Error ? error : new Error(String(error)));
+      throw error;
+    }
+    return opened;
   }
 
   attachSFTPWebSocket(ws: WebSocket): void {
@@ -272,6 +374,7 @@ export class SSHSession {
       try {
         this.ws.send(JSON.stringify({ type: 'error', message: 'SSH 连接异常: ' + errMsg }));
       } catch (e) { this.sendDebug(() => `Send error to client failed: ${e instanceof Error ? e.message : e}`); }
+      this.close();
     }
   }
 
@@ -443,6 +546,7 @@ export class SSHSession {
 
       case 'shell':
       case 'shell-requested':
+      case 'tunnel-ready':
       case 'ready':
         await this.handleSessionPacket(msgType, packet.payload);
         break;
@@ -674,34 +778,7 @@ export class SSHSession {
     this.hostKeyFingerprint = 'SHA256:' + btoa(String.fromCharCode(...fpHash)).replace(/=+$/, '');
     this.sendDebug(`Host key fingerprint: ${this.hostKeyFingerprint} (${this.hostKeyType})`);
 
-    // --- known_hosts verification (TOFU) ---
-    // Send fingerprint with key type to frontend for storage
-    try {
-      this.ws.send(JSON.stringify({ type: 'host_key', fingerprint: this.hostKeyFingerprint, keyType: this.hostKeyType }));
-    } catch (e) { /* ws closed */ }
-
-    // Compare against expected fingerprint if provided
-    if (this.config.expectedFingerprint) {
-      if (this.config.expectedFingerprint !== this.hostKeyFingerprint) {
-        this.sendError('主机密钥指纹变更！请确认是否为预期行为。', 'host_key_changed');
-        this.sendError(`已知指纹: ${this.config.expectedFingerprint}`, 'host_key_known', { fingerprint: this.config.expectedFingerprint });
-        this.sendError(`实际指纹: ${this.hostKeyFingerprint} (${this.hostKeyType})`, 'host_key_actual', {
-          fingerprint: this.hostKeyFingerprint,
-          keyType: this.hostKeyType,
-        });
-        this.sendError('连接已阻断。如需信任新密钥，请在服务器列表中删除该服务器的已知主机记录后重试。', 'host_key_trust_instruction');
-        this.close();
-        return;
-      }
-      this.sendStatus(`主机密钥验证通过 (${this.hostKeyType}) ✓`, 'host_key_accepted');
-    } else {
-      this.sendStatus(`服务器指纹: ${this.hostKeyFingerprint} (${this.hostKeyType})（首次连接，已记录）`, 'host_key_first_seen', {
-        fingerprint: this.hostKeyFingerprint,
-        keyType: this.hostKeyType,
-      });
-    }
-
-    // Verify host key signature to confirm exchange hash is correct
+    // Verify possession of the presented host key before comparing or persisting its fingerprint.
     let sigVerified: boolean | null = false;
     try {
       sigVerified = await this.verifyHostKeySignature(hostKey, signature, H);
@@ -734,6 +811,8 @@ export class SSHSession {
       }
     }
 
+    if (!this.finalizeHostKeyTrust(sigVerified === true)) return;
+
     if (!this.sessionID) {
       this.sessionID = H;
       this.sendDebug('Session ID set');
@@ -754,6 +833,85 @@ export class SSHSession {
       macS2C.keyLength
     );
     this.sendDebug('Keys derived, waiting for NEWKEYS');
+  }
+
+  /**
+   * 完成 TOFU 判定。只有服务器已证明持有当前主机私钥时，才允许浏览器记录或替换指纹。
+   */
+  private finalizeHostKeyTrust(signatureVerified: boolean): boolean {
+    const expectedFingerprint = this.config.expectedFingerprint;
+    const host = this.config.knownHostIdentity || this.config.host;
+    const commonMessage = {
+      fingerprint: this.hostKeyFingerprint,
+      keyType: this.hostKeyType,
+      host,
+      port: this.config.port,
+      displayHost: this.config.host,
+    };
+
+    if (expectedFingerprint && expectedFingerprint !== this.hostKeyFingerprint) {
+      if (signatureVerified) {
+        try {
+          this.ws.send(JSON.stringify({
+            type: 'host_key_changed',
+            ...commonMessage,
+            expectedFingerprint,
+          }));
+        } catch { /* WebSocket 已关闭 */ }
+      }
+      this.sendError('主机密钥指纹变更！请确认是否为预期行为。', 'host_key_changed');
+      this.sendError(`已知指纹: ${expectedFingerprint}`, 'host_key_known', {
+        fingerprint: expectedFingerprint,
+      });
+      this.sendError(`实际指纹: ${this.hostKeyFingerprint} (${this.hostKeyType})`, 'host_key_actual', {
+        fingerprint: this.hostKeyFingerprint,
+        keyType: this.hostKeyType,
+      });
+      this.sendError(
+        signatureVerified
+          ? '连接已阻断。请在确认对话框中核对并决定是否信任新指纹。'
+          : '连接已阻断，且主机密钥签名未通过验证，无法信任新指纹。',
+        signatureVerified ? 'host_key_trust_instruction' : 'host_key_unverified_instruction',
+      );
+      this.close(true);
+      return false;
+    }
+
+    if (expectedFingerprint) {
+      if (signatureVerified) {
+        this.sendStatus(`主机密钥验证通过 (${this.hostKeyType}) ✓`, 'host_key_accepted');
+      } else {
+        this.sendStatus(
+          `已知主机指纹匹配 (${this.hostKeyType})，但签名未验证`,
+          'host_key_fingerprint_matched_unverified',
+          { keyType: this.hostKeyType },
+        );
+      }
+      return true;
+    }
+
+    if (!signatureVerified) {
+      this.sendStatus(
+        `服务器指纹: ${this.hostKeyFingerprint} (${this.hostKeyType})（签名未验证，未记录）`,
+        'host_key_not_saved',
+        { fingerprint: this.hostKeyFingerprint, keyType: this.hostKeyType },
+      );
+      return true;
+    }
+
+    try {
+      this.ws.send(JSON.stringify({
+        type: 'host_key_verified',
+        ...commonMessage,
+        firstSeen: true,
+      }));
+    } catch { /* WebSocket 已关闭 */ }
+    this.sendStatus(
+      `服务器指纹: ${this.hostKeyFingerprint} (${this.hostKeyType})（首次连接，验证通过）`,
+      'host_key_first_seen',
+      { fingerprint: this.hostKeyFingerprint, keyType: this.hostKeyType },
+    );
+    return true;
   }
 
   private async verifyHostKeySignature(
@@ -994,26 +1152,284 @@ export class SSHSession {
   }
 
   private async authenticate(): Promise<void> {
-    let authRequest: Uint8Array;
+    // RFC 4252 §5.2: ask the server which methods may continue before
+    // sending a password or signature. This avoids wasting a credential
+    // attempt on hosts such as Serv00 that expose password verification only
+    // through keyboard-interactive.
+    this.activeAuthMethod = 'none';
+    this.attemptedAuthMethods.add('none');
+    await this.sendEncrypted(SSHAuth.buildNoneAuthRequest(this.config.username));
+  }
 
-    if (this.config.authMethod === 'publickey' && this.config.privateKey) {
-      this.sendStatus('正在使用密钥认证...', 'auth_public_key');
-      authRequest = await SSHAuth.buildPublicKeyAuthRequest(
-        this.config.username,
-        this.config.privateKey,
-        this.sessionID!,
-        this.serverSigAlgs,            // 传入 server-sig-algs 协商 RSA 签名算法
-        false,                         // allowLegacyRsaSha1: 默认禁用 SHA-1
-      );
-    } else {
-      authRequest = SSHAuth.buildPasswordAuthRequest(
-        this.config.username,
-        this.config.password
-      );
+  private canUseAuthMethod(method: ActiveAuthMethod): boolean {
+    switch (method) {
+      case 'none':
+        return true;
+      case 'publickey':
+        return this.config.authMethod === 'publickey'
+          && Boolean(this.config.privateKey && this.sessionID);
+      case 'password':
+        return this.config.authMethod !== 'publickey' && Boolean(this.config.password);
+      case 'keyboard-interactive':
+        return true;
+    }
+  }
+
+  private async authenticateWithMethod(method: ActiveAuthMethod): Promise<boolean> {
+    if (this.attemptedAuthMethods.has(method) || !this.canUseAuthMethod(method)) {
+      return false;
     }
 
-    const packet = await this.buildEncryptedPacket(authRequest);
-    await this.writeSocket(packet);
+    let authRequest: Uint8Array;
+    switch (method) {
+      case 'none':
+        authRequest = SSHAuth.buildNoneAuthRequest(this.config.username);
+        break;
+      case 'publickey':
+        this.sendStatus('正在使用密钥认证...', 'auth_public_key');
+        authRequest = await SSHAuth.buildPublicKeyAuthRequest(
+          this.config.username,
+          this.config.privateKey!,
+          this.sessionID!,
+          this.serverSigAlgs,
+          false,
+        );
+        break;
+      case 'password':
+        authRequest = SSHAuth.buildPasswordAuthRequest(
+          this.config.username,
+          this.config.password,
+        );
+        break;
+      case 'keyboard-interactive':
+        this.clearPendingAuthChallenge();
+        this.sendStatus('服务器要求交互式认证', 'auth_interactive_required');
+        authRequest = SSHAuth.buildKeyboardInteractiveAuthRequest(this.config.username);
+        break;
+    }
+
+    this.activeAuthMethod = method;
+    this.attemptedAuthMethods.add(method);
+    await this.sendEncrypted(authRequest);
+    return true;
+  }
+
+  private selectNextAuthMethod(
+    allowedMethods: string[],
+    previousMethod: ActiveAuthMethod | null,
+  ): ActiveAuthMethod | null {
+    const configuredFirst: ActiveAuthMethod[] = this.config.authMethod === 'publickey'
+      ? ['publickey', 'keyboard-interactive']
+      : ['password', 'keyboard-interactive'];
+    // RFC 4252 allows a server to omit the list in a failure response. Keep
+    // compatibility with such servers after the harmless "none" probe by
+    // falling back to the user's configured primary method.
+    const effectiveAllowedMethods = previousMethod === 'none' && allowedMethods.length === 0
+      ? configuredFirst
+      : allowedMethods;
+    const candidates = configuredFirst.filter((method) =>
+      effectiveAllowedMethods.includes(method)
+      && !this.attemptedAuthMethods.has(method)
+      && this.canUseAuthMethod(method)
+    );
+
+    return candidates.find((method) => method !== previousMethod)
+      ?? candidates[0]
+      ?? null;
+  }
+
+  private failAuthentication(
+    message?: string,
+    event?: string,
+    normalClose: boolean = false,
+  ): void {
+    const wasInteractive = this.activeAuthMethod === 'keyboard-interactive';
+    this.clearPendingAuthChallenge();
+    this.activeAuthMethod = null;
+    this.sendError(
+      message ?? (wasInteractive
+        ? '交互式认证失败：服务器拒绝了响应'
+        : '认证失败：用户名、凭据或交互式响应无效'),
+      event ?? (wasInteractive ? 'auth_interactive_failed' : 'auth_failed'),
+    );
+    this.close(normalClose);
+  }
+
+  private clearPendingAuthChallenge(): void {
+    if (!this.pendingAuthChallenge) return;
+    clearTimeout(this.pendingAuthChallenge.timeout);
+    this.pendingAuthChallenge = null;
+  }
+
+  private async handleKeyboardInteractiveInfoRequest(payload: Uint8Array): Promise<void> {
+    if (this.activeAuthMethod !== 'keyboard-interactive') {
+      this.failAuthentication(
+        '服务器发送了当前认证方式不支持的交互消息',
+        'auth_interactive_protocol_error',
+      );
+      return;
+    }
+    if (this.pendingAuthChallenge) {
+      this.failAuthentication(
+        '服务器在上一轮响应前发送了新的交互式认证请求',
+        'auth_interactive_protocol_error',
+      );
+      return;
+    }
+    if (this.keyboardInteractiveRounds >= MAX_KEYBOARD_INTERACTIVE_ROUNDS) {
+      this.failAuthentication(
+        '交互式认证轮次过多，连接已终止',
+        'auth_interactive_limit',
+      );
+      return;
+    }
+
+    let request: ReturnType<typeof SSHAuth.parseKeyboardInteractiveInfoRequest>;
+    try {
+      request = SSHAuth.parseKeyboardInteractiveInfoRequest(payload);
+    } catch {
+      this.failAuthentication(
+        '服务器发送了无效的交互式认证请求',
+        'auth_interactive_protocol_error',
+      );
+      return;
+    }
+
+    this.keyboardInteractiveRounds++;
+    const id = crypto.randomUUID();
+    const timeout = setTimeout(() => {
+      if (this.pendingAuthChallenge?.id !== id) return;
+      this.pendingAuthChallenge = null;
+      this.sendError(
+        '浏览器未确认显示交互式认证请求，请刷新页面后重试',
+        'auth_interactive_client_unavailable',
+      );
+      // Authentication timeouts are expected application outcomes. A normal
+      // close also prevents older frontends from reconnecting repeatedly and
+      // triggering provider-side IP bans.
+      this.close(true);
+    }, AUTH_CHALLENGE_ACK_TIMEOUT_MS);
+
+    this.pendingAuthChallenge = {
+      id,
+      prompts: request.prompts.map((prompt) => ({ ...prompt })),
+      phase: 'awaiting_ack',
+      timeout,
+    };
+
+    try {
+      this.ws.send(JSON.stringify({
+        type: 'auth_challenge',
+        id,
+        name: request.name,
+        instruction: request.instruction,
+        prompts: request.prompts,
+        host: this.config.host,
+        port: this.config.port,
+        canUseStoredPassword: Boolean(
+          this.config.password
+          && this.config.authMethod !== 'publickey'
+          && request.prompts.length === 1
+          && !request.prompts[0].echo
+        ),
+      }));
+    } catch {
+      this.clearPendingAuthChallenge();
+      this.close();
+    }
+  }
+
+  private handleKeyboardInteractiveAck(message: Record<string, unknown>): void {
+    if (this.state !== 'auth' || this.activeAuthMethod !== 'keyboard-interactive') return;
+
+    const pending = this.pendingAuthChallenge;
+    if (!pending || typeof message.id !== 'string' || message.id !== pending.id) {
+      this.sendError('交互式认证确认已过期或不匹配', 'auth_interactive_stale');
+      return;
+    }
+    if (pending.phase === 'awaiting_response') return;
+
+    clearTimeout(pending.timeout);
+    pending.phase = 'awaiting_response';
+    const id = pending.id;
+    pending.timeout = setTimeout(() => {
+      if (this.pendingAuthChallenge?.id !== id) return;
+      this.pendingAuthChallenge = null;
+      this.sendError('等待交互式认证响应超时', 'auth_interactive_timeout');
+      this.close(true);
+    }, AUTH_CHALLENGE_RESPONSE_TIMEOUT_MS);
+    this.sendDebug('Browser displayed the interactive authentication challenge');
+  }
+
+  private async handleKeyboardInteractiveResponse(message: Record<string, unknown>): Promise<void> {
+    if (this.state !== 'auth' || this.activeAuthMethod !== 'keyboard-interactive') return;
+
+    const pending = this.pendingAuthChallenge;
+    if (!pending || typeof message.id !== 'string' || message.id !== pending.id) {
+      this.sendError('交互式认证响应已过期或不匹配', 'auth_interactive_stale');
+      return;
+    }
+
+    let responses: string[];
+    if (message.useStoredPassword === true) {
+      if (
+        !this.config.password
+        || this.config.authMethod === 'publickey'
+        || pending.prompts.length !== 1
+        || pending.prompts[0].echo
+        || Object.prototype.hasOwnProperty.call(message, 'responses')
+      ) {
+        this.failAuthentication(
+          '当前交互式认证请求不能使用已保存密码',
+          'auth_interactive_invalid_response',
+        );
+        return;
+      }
+      responses = [this.config.password];
+    } else {
+      if (
+        !Array.isArray(message.responses)
+        || message.responses.length !== pending.prompts.length
+        || !message.responses.every((response) => typeof response === 'string')
+      ) {
+        this.failAuthentication(
+          '交互式认证响应数量或格式无效',
+          'auth_interactive_invalid_response',
+        );
+        return;
+      }
+      responses = message.responses as string[];
+    }
+
+    let responsePayload: Uint8Array;
+    try {
+      responsePayload = SSHAuth.buildKeyboardInteractiveInfoResponse(responses);
+    } catch {
+      this.failAuthentication(
+        '交互式认证响应超过安全限制',
+        'auth_interactive_invalid_response',
+      );
+      return;
+    }
+
+    this.clearPendingAuthChallenge();
+    try {
+      await this.sendEncrypted(responsePayload);
+    } catch {
+      this.sendError('发送交互式认证响应失败', 'auth_interactive_send_failed');
+      this.close();
+    }
+  }
+
+  private handleKeyboardInteractiveCancel(message: Record<string, unknown>): void {
+    if (this.state !== 'auth' || this.activeAuthMethod !== 'keyboard-interactive') return;
+    const pending = this.pendingAuthChallenge;
+    if (!pending || typeof message.id !== 'string' || message.id !== pending.id) return;
+
+    this.clearPendingAuthChallenge();
+    this.activeAuthMethod = null;
+    this.sendStatus('交互式认证已取消', 'auth_interactive_cancelled');
+    this.close(true);
   }
 
   private async handleAuthPacket(msgType: number, payload: Uint8Array): Promise<void> {
@@ -1042,15 +1458,111 @@ export class SSHSession {
         break;
 
       case SSH_MSG_USERAUTH_SUCCESS:
+        this.clearPendingAuthChallenge();
+        this.activeAuthMethod = null;
         this.sendStatus('认证成功', 'auth_success');
-        this.state = 'shell';
         this.startKeepalive();
-        await this.openShell();
+        if (this.openShellOnAuth) {
+          this.state = 'shell';
+          this.authenticatedSettled = true;
+          this.authenticatedResolve();
+          await this.openShell();
+        } else {
+          this.state = 'tunnel-ready';
+          this.authenticatedSettled = true;
+          this.authenticatedResolve();
+        }
         break;
 
-      case SSH_MSG_USERAUTH_FAILURE:
-        this.sendError('认证失败：用户名或密码错误', 'auth_failed');
-        this.close();
+      case SSH_MSG_USERAUTH_FAILURE: {
+        if (this.pendingAuthChallenge) {
+          this.failAuthentication(
+            '服务器在等待交互式认证响应时提前结束了当前认证步骤',
+            'auth_interactive_protocol_error',
+          );
+          break;
+        }
+
+        let allowedMethods: string[];
+        let partialSuccess = false;
+        try {
+          const result = SSHAuth.handleResponse(payload);
+          allowedMethods = result.allowedMethods ?? [];
+          partialSuccess = result.partialSuccess === true;
+        } catch {
+          this.failAuthentication(
+            '服务器发送了无效的认证失败响应',
+            'auth_interactive_protocol_error',
+          );
+          break;
+        }
+
+        this.sendDebug(
+          `Authentication failure: allowed=[${allowedMethods.join(',')}], partial=${partialSuccess}`,
+        );
+        const previousMethod = this.activeAuthMethod;
+        const configuredPrimaryMethod: ActiveAuthMethod =
+          this.config.authMethod === 'publickey' ? 'publickey' : 'password';
+        if (partialSuccess) {
+          this.partialAuthenticationStages++;
+          if (this.partialAuthenticationStages > MAX_PARTIAL_AUTHENTICATION_STAGES) {
+            this.failAuthentication(
+              '多因素认证步骤过多，连接已终止',
+              'auth_interactive_limit',
+            );
+            break;
+          }
+          // A partial success starts a new authentication factor. Methods that
+          // failed only because the server required a different order may now
+          // be attempted again (for example keyboard-interactive,publickey).
+          this.attemptedAuthMethods.clear();
+        } else if (
+          previousMethod === configuredPrimaryMethod
+          && allowedMethods.includes(configuredPrimaryMethod)
+        ) {
+          // The configured credential was rejected and the server still
+          // offers the same method. Do not reinterpret that rejection as an
+          // interactive challenge merely because keyboard-interactive is
+          // also advertised.
+          this.sendDebug(`Configured authentication method rejected: ${configuredPrimaryMethod}`);
+          this.failAuthentication(undefined, 'auth_failed', true);
+          break;
+        }
+
+        const nextMethod = this.selectNextAuthMethod(allowedMethods, previousMethod);
+        if (nextMethod && await this.authenticateWithMethod(nextMethod)) {
+          break;
+        }
+
+        // A server-side credential rejection is an expected authentication
+        // outcome, not an internal WebSocket failure.
+        this.failAuthentication(undefined, undefined, true);
+        break;
+      }
+
+      case SSH_MSG_USERAUTH_INFO_REQUEST:
+        if (this.activeAuthMethod === 'keyboard-interactive') {
+          await this.handleKeyboardInteractiveInfoRequest(payload);
+        } else if (this.activeAuthMethod === 'password') {
+          // Message number 60 is SSH_MSG_USERAUTH_PASSWD_CHANGEREQ in the
+          // password method (RFC 4252), not an RFC 4256 INFO_REQUEST.
+          this.failAuthentication(
+            '服务器要求更改已过期密码，当前版本暂不支持在认证期间修改密码',
+            'auth_password_change_required',
+          );
+        } else if (this.activeAuthMethod === 'publickey') {
+          // With publickey it is SSH_MSG_USERAUTH_PK_OK. CloudSSH always sends
+          // the signature in its first request, so this response is unexpected.
+          this.failAuthentication(
+            '服务器返回了意外的公钥认证确认',
+            'auth_protocol_error',
+          );
+        } else {
+          this.failAuthentication(
+            '服务器在认证方式探测阶段返回了意外消息',
+            'auth_protocol_error',
+          );
+        }
         break;
 
       case SSH_MSG_UNIMPLEMENTED:
@@ -1084,7 +1596,14 @@ export class SSHSession {
         channel.handleOpenConfirmation(payload);
         this.sendDebug(`CHANNEL_OPEN_CONFIRMATION: channelID=${channelID}, remoteChannelID=${channel.getRemoteChannelID()}, isSFTP=${this.sftpHandler && channelID === this.sftpHandler.getChannelID()}`);
 
-        if (channel === this.shellChannel) {
+        const directPending = this.pendingDirectTcpip.get(channelID);
+        if (directPending) {
+          clearTimeout(directPending.timeout);
+          this.pendingDirectTcpip.delete(channelID);
+          const stream = this.directTcpipStreams.get(channelID);
+          if (stream) directPending.resolve(stream);
+          else directPending.reject(new Error('direct-tcpip stream disappeared'));
+        } else if (channel === this.shellChannel) {
           // Shell channel: send PTY request
           const ptyReq = channel.buildPTYRequest(this.terminalSize.cols, this.terminalSize.rows);
           await this.sendEncrypted(ptyReq);
@@ -1114,7 +1633,17 @@ export class SSHSession {
 
         this.channels.delete(channelID);
 
-        if (this.sftpHandler && channelID === this.sftpHandler.getChannelID()) {
+        const directPending = this.pendingDirectTcpip.get(channelID);
+        const directStream = this.directTcpipStreams.get(channelID);
+        if (directPending || directStream) {
+          if (directPending) {
+            clearTimeout(directPending.timeout);
+            directPending.reject(new Error(`跳板服务器拒绝 TCP 转发：${description || `reason ${reasonCode}`}`));
+            this.pendingDirectTcpip.delete(channelID);
+          }
+          directStream?.remoteClose(new Error(description || `direct-tcpip rejected (${reasonCode})`));
+          this.directTcpipStreams.delete(channelID);
+        } else if (this.sftpHandler && channelID === this.sftpHandler.getChannelID()) {
           // SFTP channel open failed - notify frontend, don't close terminal
           this.sendDebug(`SFTP channel open failed: reason=${reasonCode}, desc=${description}`);
           this.sendSFTPError('init', '服务器不支持 SFTP: ' + description);
@@ -1145,7 +1674,7 @@ export class SSHSession {
           this.shellReadyTimeout = setTimeout(() => {
             if (this.state === 'shell-requested') {
               this.state = 'ready';
-              this.sendStatus('Shell 已就绪', 'shell_ready');
+              this.onShellReady();
             }
           }, 3000);
         } else if (channelID === this.shellChannel.getLocalChannelID() && this.state === 'shell-requested') {
@@ -1155,7 +1684,7 @@ export class SSHSession {
             this.shellReadyTimeout = null;
           }
           this.state = 'ready';
-          this.sendStatus('Shell 已就绪', 'shell_ready');
+          this.onShellReady();
         } else if (this.sftpHandler && channelID === this.sftpHandler.getChannelID()) {
           // SFTP subsystem request confirmed - send SFTP init
           this.sendDebug(`SFTP CHANNEL_SUCCESS received, calling onSubsystemReady`);
@@ -1199,7 +1728,11 @@ export class SSHSession {
           return;
         }
 
-        if (channel === this.shellChannel) {
+        const directStream = this.directTcpipStreams.get(channelID);
+        if (directStream) {
+          const forwardedData = channel.handleChannelData(payload);
+          directStream.push(forwardedData);
+        } else if (channel === this.shellChannel) {
           // Shell channel data - forward to terminal
           if (this.state === 'shell-requested') {
             if (this.shellReadyTimeout) {
@@ -1207,7 +1740,7 @@ export class SSHSession {
               this.shellReadyTimeout = null;
             }
             this.state = 'ready';
-            this.sendStatus('Shell 已就绪', 'shell_ready');
+            this.onShellReady();
           }
           const outputData = channel.handleChannelData(payload);
           try { this.ws.send(outputData); } catch (e) { this.sendDebug(() => `Send shell output failed: ${e instanceof Error ? e.message : e}`); }
@@ -1268,6 +1801,11 @@ export class SSHSession {
         const channel = this.getChannelByID(channelID);
         if (channel) {
           channel.handleWindowAdjust(payload);
+          const waiters = this.channelWindowWaiters.get(channelID);
+          if (waiters) {
+            this.channelWindowWaiters.delete(channelID);
+            for (const wake of waiters) wake();
+          }
           if (channel === this.shellChannel) {
             void this.flushChannelDataQueue();
           } else if (this.sftpHandler && channelID === this.sftpHandler.getChannelID()) {
@@ -1291,6 +1829,10 @@ export class SSHSession {
             this.sftpHandler.dispose();
             this.sftpHandler = null;
             this.channels.delete(channelID);
+          }
+          const directStream = this.directTcpipStreams.get(channelID);
+          if (directStream) {
+            directStream.remoteEof();
           }
           const execCh = this.activeExecChannels.get(channelID);
           if (execCh) {
@@ -1321,6 +1863,14 @@ export class SSHSession {
           }
 
           this.channels.delete(channelID);
+          const directStream = this.directTcpipStreams.get(channelID);
+          if (directStream) {
+            directStream.remoteClose();
+            this.directTcpipStreams.delete(channelID);
+            const waiters = this.channelWindowWaiters.get(channelID);
+            this.channelWindowWaiters.delete(channelID);
+            if (waiters) for (const wake of waiters) wake();
+          }
           if (this.sftpHandler && channelID === this.sftpHandler.getChannelID()) {
             this.sftpHandler.onChannelClosed();
             this.sftpHandler = null;
@@ -1386,8 +1936,23 @@ export class SSHSession {
       }
 
       if (parsed && typeof parsed === 'object') {
+        if (parsed.type === 'auth_challenge_ack') {
+          this.handleKeyboardInteractiveAck(parsed);
+          return;
+        }
+        if (parsed.type === 'auth_response') {
+          await this.handleKeyboardInteractiveResponse(parsed);
+          return;
+        }
+        if (parsed.type === 'auth_cancel') {
+          this.handleKeyboardInteractiveCancel(parsed);
+          return;
+        }
         if (parsed.type === 'ping') {
-          this.ws.send(JSON.stringify({ type: 'pong' }));
+          const id = typeof parsed.id === 'string' && parsed.id.length <= 128
+            ? parsed.id
+            : undefined;
+          this.ws.send(JSON.stringify({ type: 'pong', ...(id ? { id } : {}) }));
           return;
         }
         if (parsed.type === 'resize') {
@@ -1492,7 +2057,7 @@ export class SSHSession {
         this.sftpHandler.cancelDownload();
         break;
       case 'sftp_upload_start':
-        await this.sftpHandler.uploadStart(msg.path, msg.size || 0);
+        await this.sftpHandler.uploadStart(msg.path, msg.size || 0, msg.overwrite === true);
         break;
       case 'sftp_upload_end':
         await this.sftpHandler.uploadEnd();
@@ -1687,6 +2252,45 @@ export class SSHSession {
     }
   }
 
+  private async sendDirectTcpipData(
+    channelID: number,
+    channel: SSHChannel,
+    data: Uint8Array,
+  ): Promise<void> {
+    let offset = 0;
+    while (offset < data.length) {
+      if (!this.directTcpipStreams.has(channelID) || channel.isClosed()) {
+        throw new Error('direct-tcpip channel closed while writing');
+      }
+      const chunk = channel.takeChannelDataChunk(data, offset);
+      if (!chunk) {
+        await new Promise<void>((resolve) => {
+          const waiters = this.channelWindowWaiters.get(channelID) || [];
+          waiters.push(resolve);
+          this.channelWindowWaiters.set(channelID, waiters);
+        });
+        continue;
+      }
+      await this.sendEncryptedChannelData(chunk, channel);
+      offset += chunk.bytesConsumed;
+    }
+  }
+
+  private async closeDirectTcpipChannel(channelID: number, channel: SSHChannel): Promise<void> {
+    this.directTcpipStreams.delete(channelID);
+    this.channels.delete(channelID);
+    const waiters = this.channelWindowWaiters.get(channelID);
+    this.channelWindowWaiters.delete(channelID);
+    if (waiters) for (const wake of waiters) wake();
+    if (channel.isClosed()) return;
+    try {
+      await this.sendEncrypted(channel.buildEof());
+      await this.sendEncrypted(channel.buildClose());
+    } catch {
+      // The parent SSH session may already be closing.
+    }
+  }
+
   private async handleResize(cols: unknown, rows: unknown): Promise<void> {
     if (!this.updateTerminalSize(cols, rows)) return;
     if (this.state !== 'ready') return;
@@ -1763,6 +2367,66 @@ export class SSHSession {
       this.ws.send(JSON.stringify({ type: 'debug', message: typeof message === 'function' ? message() : message }));
     } catch (e) {
       // WebSocket 已关闭，调试消息无法送达
+    }
+  }
+
+  // ==================== 操作系统检测 ====================
+
+  /** Shell 就绪统一入口：发送状态并触发远端 OS 检测（尽力而为，不阻塞就绪流程） */
+  private onShellReady(): void {
+    this.sendStatus('Shell 已就绪', 'shell_ready');
+    void this.detectRemoteOS();
+  }
+
+  /**
+   * 通过独立 exec channel 检测远端操作系统并持久化到 UserDBDO。
+   * 仅对已登录用户的已保存服务器执行；解析/持久化失败都不影响 SSH 会话。
+   */
+  private async detectRemoteOS(): Promise<void> {
+    // 已保存服务器（token 路径才有 serverId）、未检测过、且未在进行中
+    if (!this.config.serverId || !this.userId || !this.githubId || this.config.os || this.osDetectInProgress) {
+      return;
+    }
+    this.osDetectInProgress = true;
+    try {
+      const result = await this.executeAgentCommand(DETECT_OS_COMMAND, 5000);
+      // stderr 可能包含 Shell 或权限错误，不能参与发行版名称解析。
+      const os = parseDetectedOS(result.stdout);
+      if (!isDetectedOS(os)) {
+        this.sendDebug('OS detect returned unknown; leaving it unset for the next connection');
+        return;
+      }
+
+      // 防止同一会话内重复触发；数据库写入失败时，下次新连接仍会再次检测。
+      this.config.os = os;
+
+      try {
+        if (this.env) {
+          const stub = this.env.USER_DB.get(this.env.USER_DB.idFromName(this.githubId));
+          const res = await stub.fetch(
+            new Request(`http://internal/internal/servers/${this.config.serverId}/os`, {
+              method: 'PUT',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ user_id: Number(this.userId), os }),
+            })
+          );
+          if (!res.ok) {
+            this.sendDebug(`OS detect persist failed: ${res.status}`);
+          }
+        }
+      } catch (e) {
+        this.sendDebug(`OS detect persist error: ${e instanceof Error ? e.message : String(e)}`);
+      }
+
+      try {
+        if (this.ws.readyState === WebSocket.OPEN) {
+          this.ws.send(JSON.stringify({ type: 'os_detected', serverId: this.config.serverId, os }));
+        }
+      } catch (e) { /* ws closed */ }
+    } catch (e) {
+      this.sendDebug(`OS detect error: ${e instanceof Error ? e.message : String(e)}`);
+    } finally {
+      this.osDetectInProgress = false;
     }
   }
 
@@ -1966,6 +2630,16 @@ export class SSHSession {
   }
 
   close(normal: boolean = false): void {
+    if (this.closed) return;
+    this.closed = true;
+    if (!this.authenticatedSettled) {
+      this.authenticatedSettled = true;
+      const error = new Error('SSH session closed before authentication completed') as Error & { normalClose?: boolean };
+      error.normalClose = normal;
+      this.authenticatedReject(error);
+    }
+    this.clearPendingAuthChallenge();
+    this.activeAuthMethod = null;
     if (this.keepaliveInterval) {
       clearInterval(this.keepaliveInterval);
       this.keepaliveInterval = null;
@@ -1989,6 +2663,18 @@ export class SSHSession {
       execCh.onClose();
     }
     this.activeExecChannels.clear();
+    for (const [channelID, pending] of this.pendingDirectTcpip) {
+      clearTimeout(pending.timeout);
+      pending.reject(new Error('SSH jump session closed'));
+      this.directTcpipStreams.get(channelID)?.remoteClose(new Error('SSH jump session closed'));
+    }
+    this.pendingDirectTcpip.clear();
+    for (const stream of this.directTcpipStreams.values()) stream.remoteClose();
+    this.directTcpipStreams.clear();
+    for (const waiters of this.channelWindowWaiters.values()) {
+      for (const wake of waiters) wake();
+    }
+    this.channelWindowWaiters.clear();
     if (this.confirmationResolve) {
       this.confirmationResolve(false);
       this.confirmationResolve = null;
@@ -2002,6 +2688,8 @@ export class SSHSession {
     try { this.socket.close(); } catch (e) { this.sendDebug(() => `Close TCP socket: ${e instanceof Error ? e.message : e}`); }
     try { this.sftpWs?.close(normal ? 1000 : 1011); } catch (e) { this.sendDebug(() => `Close SFTP ws: ${e instanceof Error ? e.message : e}`); }
     this.sftpWs = null;
-    try { this.ws.close(normal ? 1000 : 1011); } catch (e) { this.sendDebug(() => `Close SSH ws: ${e instanceof Error ? e.message : e}`); }
+    if (this.ownsWebSocket) {
+      try { this.ws.close(normal ? 1000 : 1011); } catch (e) { this.sendDebug(() => `Close SSH ws: ${e instanceof Error ? e.message : e}`); }
+    }
   }
 }
