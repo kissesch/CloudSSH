@@ -1,3 +1,17 @@
+import { AIConfigPanel } from './ai-config';
+import { ConnectionForm } from './auth-form';
+import { initI18n, onLocaleChange, t } from './i18n';
+import { MobileTerminalController } from './mobile-terminal';
+import { ServerList } from './server-list';
+import {
+  type ClaimedShare,
+  renderShareEnded,
+  renderShareLanding,
+  takeShareTokenFromLocation,
+} from './share-session';
+import { SnippetManager } from './snippet-manager';
+import { TabManager } from './tab-manager';
+import type { SSHHostInfo, SSHTerminal } from './terminal';
 import {
   applyBuiltInTheme,
   applyImportedTheme,
@@ -5,20 +19,7 @@ import {
   normalizeImportedTheme,
   THEME_MAX_BYTES,
 } from './theme';
-import type { SSHHostInfo, SSHTerminal } from './terminal';
-import { ConnectionForm } from './auth-form';
-import { ServerList } from './server-list';
-import { TabManager } from './tab-manager';
-import { AIConfigPanel } from './ai-config';
 import { notify } from './ui-feedback';
-import { initI18n, onLocaleChange, t } from './i18n';
-import { MobileTerminalController } from './mobile-terminal';
-import {
-  renderShareEnded,
-  renderShareLanding,
-  takeShareTokenFromLocation,
-  type ClaimedShare,
-} from './share-session';
 
 // ==================== 全局状态 ====================
 
@@ -28,8 +29,12 @@ let serverList: ServerList | null = null;
 let isLoggedIn = false;
 let sharedSessionMode = false;
 const mobileTerminalController = new MobileTerminalController(
-  () => tabManager?.getActiveTab()?.terminal ?? null,
+  () => tabManager?.getActiveTab()?.terminal ?? null
 );
+const snippetManager = new SnippetManager({
+  getTerminal: () => tabManager?.getActiveTab()?.terminal ?? null,
+  isAuthenticated: () => isLoggedIn && !sharedSessionMode,
+});
 
 function setUserSpaceMenuOpen(open: boolean): void {
   document.getElementById('user-space-header-actions')?.classList.toggle('is-open', open);
@@ -48,11 +53,15 @@ function initUserSpaceMobileMenu(): void {
     if ((event.target as HTMLElement).closest('button')) setUserSpaceMenuOpen(false);
   });
   menu.addEventListener('change', () => setUserSpaceMenuOpen(false));
-  document.addEventListener('pointerdown', (event) => {
-    const target = event.target as Node | null;
-    if (target && (button.contains(target) || menu.contains(target))) return;
-    setUserSpaceMenuOpen(false);
-  }, true);
+  document.addEventListener(
+    'pointerdown',
+    (event) => {
+      const target = event.target as Node | null;
+      if (target && (button.contains(target) || menu.contains(target))) return;
+      setUserSpaceMenuOpen(false);
+    },
+    true
+  );
 }
 
 function initServerPaginationBreakpoints(): void {
@@ -60,9 +69,9 @@ function initServerPaginationBreakpoints(): void {
     window.matchMedia('(max-width: 767px)'),
     window.matchMedia('(max-width: 1180px) and (pointer: coarse)'),
   ];
-  queries.forEach((query) => {
+  for (const query of queries) {
     query.addEventListener('change', () => serverList?.refreshPageSize());
-  });
+  }
 }
 
 /** 获取或初始化 TabManager 单例 */
@@ -76,6 +85,10 @@ function getTabManager(): TabManager {
     // 连接后检测到操作系统 → 即时更新服务器列表卡片图标
     tabManager.setOSDetectedHandler((serverId, os) => {
       serverList?.updateServerOS(serverId, os);
+    });
+    // 标签数量变化 → 同步“返回终端”按钮显隐
+    tabManager.setTabsChangedHandler(() => {
+      syncConnectionBackButtons();
     });
 
     // 绑定 new-tab-btn
@@ -94,6 +107,52 @@ function bindNewTabButton(): void {
   });
 }
 
+function syncConnectionBackButtons(): void {
+  const hasTabs = tabManager?.hasAnyTab() ?? false;
+  document.getElementById('back-to-terminal-btn')?.classList.toggle('hidden', !hasTabs);
+  document.getElementById('back-to-terminal-from-auth-btn')?.classList.toggle('hidden', !hasTabs);
+}
+
+function activateTerminalView(): void {
+  document.getElementById('auth-section')!.classList.add('hidden');
+  document.getElementById('user-space-section')!.classList.add('hidden');
+  document.getElementById('user-space-section')!.classList.remove('flex');
+  document.getElementById('server-modal')?.classList.add('hidden');
+  document.getElementById('server-modal')?.classList.remove('flex');
+  document.getElementById('terminal-section')!.classList.remove('hidden');
+  document.getElementById('terminal-section')!.classList.add('flex');
+  document.body.classList.add('terminal-active');
+}
+
+function showTerminalSection(): void {
+  if (!tabManager || !tabManager.hasAnyTab()) return;
+  tabManager.getActiveTab()?.agentPanel?.rejectPendingConfirmation(false);
+  activateTerminalView();
+  tabManager.getActiveTab()?.terminal.fit();
+}
+
+function bindBackToTerminalButtons(): void {
+  document.getElementById('back-to-terminal-btn')?.addEventListener('click', () => {
+    showTerminalSection();
+  });
+  document.getElementById('back-to-terminal-from-auth-btn')?.addEventListener('click', () => {
+    showTerminalSection();
+  });
+  // 支持 Esc 快速返回已有的终端会话
+  document.addEventListener('keydown', (event) => {
+    if (event.key !== 'Escape') return;
+    const terminalHidden =
+      document.getElementById('terminal-section')?.classList.contains('hidden') ?? true;
+    if (!terminalHidden) return;
+    if (!tabManager?.hasAnyTab()) return;
+    const activeModal = document.getElementById('server-modal');
+    // 若服务器编辑弹窗打开，优先关闭弹窗而非返回终端
+    if (activeModal && !activeModal.classList.contains('hidden')) return;
+    event.preventDefault();
+    showTerminalSection();
+  });
+}
+
 // ==================== 独立终端标签页模式 ====================
 
 function isTerminalTab(): boolean {
@@ -105,8 +164,10 @@ function validateWsUrl(wsUrl: string): boolean {
   try {
     const url = new URL(wsUrl);
     if (url.protocol !== 'wss:' && url.protocol !== 'ws:') return false;
-    return url.origin === window.location.origin ||
-           url.origin === window.location.origin.replace(/^http/, 'ws');
+    return (
+      url.origin === window.location.origin ||
+      url.origin === window.location.origin.replace(/^http/, 'ws')
+    );
   } catch {
     return false;
   }
@@ -120,7 +181,12 @@ function initTerminalTab(): void {
   const port = parseInt(params.get('port') || '0') || 0;
 
   if (!validateWsUrl(wsUrl)) {
-    document.body.innerHTML = `<div style="color:var(--error);padding:2em;font-family:monospace;">${t('terminal.invalidUrl')}</div>`;
+    const errorDiv = document.createElement('div');
+    errorDiv.style.color = 'var(--error)';
+    errorDiv.style.padding = '2em';
+    errorDiv.style.fontFamily = 'monospace';
+    errorDiv.textContent = t('terminal.invalidUrl');
+    document.body.replaceChildren(errorDiv);
     return;
   }
 
@@ -167,9 +233,15 @@ function showAuthSection(): void {
       getTabManager,
     });
   }
+  syncConnectionBackButtons();
 }
 
-function showUserSpace(user: { id: number; github_id: number; username: string; avatar_url: string }): void {
+function showUserSpace(user: {
+  id: number;
+  github_id: number;
+  username: string;
+  avatar_url: string;
+}): void {
   deactivateTerminalView();
   isLoggedIn = true;
   document.getElementById('auth-section')!.classList.add('hidden');
@@ -210,6 +282,7 @@ function showConnectionPage(): void {
   } else {
     showAuthSection();
   }
+  syncConnectionBackButtons();
 }
 
 function showOfflineUI(): void {
@@ -238,21 +311,20 @@ function showOfflineUI(): void {
     showAuthSection();
   }
 
-  document.getElementById('status-text')!.innerHTML = `<span class="w-2 h-2 bg-surface-dot inline-block"></span> ${t('auth.statusOffline')}`;
+  const statusText = document.getElementById('status-text');
+  if (statusText) {
+    const dot = document.createElement('span');
+    dot.className = 'w-2 h-2 bg-surface-dot inline-block';
+    statusText.replaceChildren(dot, document.createTextNode(t('auth.statusOffline')));
+  }
 }
 
 /** 在终端页面创建新标签并显示终端视图 */
 function showTerminalWithNewTab(
-  label: string,
   displayLabel: string,
-  hostInfo?: SSHHostInfo,
+  hostInfo?: SSHHostInfo
 ): { tab: ReturnType<TabManager['createTab']>; terminal: SSHTerminal } {
-  document.getElementById('auth-section')!.classList.add('hidden');
-  document.getElementById('user-space-section')!.classList.add('hidden');
-  document.getElementById('user-space-section')!.classList.remove('flex');
-  document.getElementById('terminal-section')!.classList.remove('hidden');
-  document.getElementById('terminal-section')!.classList.add('flex');
-  document.body.classList.add('terminal-active');
+  activateTerminalView();
 
   const tm = getTabManager();
   const tab = tm.createTab(displayLabel, hostInfo);
@@ -260,11 +332,7 @@ function showTerminalWithNewTab(
   return { tab, terminal: tab.terminal };
 }
 
-function showTerminalFromServer(
-  wsUrl: string,
-  serverName: string,
-  hostInfo?: SSHHostInfo,
-): void {
+function showTerminalFromServer(wsUrl: string, serverName: string, hostInfo?: SSHHostInfo): void {
   if (!validateWsUrl(wsUrl)) {
     notify(t('server.invalidWs'), {
       title: t('server.connectFailed'),
@@ -273,11 +341,7 @@ function showTerminalFromServer(
     return;
   }
 
-  const { terminal } = showTerminalWithNewTab(
-    serverName,
-    serverName,
-    hostInfo
-  );
+  const { terminal } = showTerminalWithNewTab(serverName, hostInfo);
 
   terminal.mount();
 
@@ -285,9 +349,7 @@ function showTerminalFromServer(
   const ws = new WebSocket(wsUrl);
   ws.binaryType = 'arraybuffer';
   const serverId = hostInfo?.serverId;
-  const reconnectFactory = serverId
-    ? () => requestSavedServerWebSocket(serverId)
-    : undefined;
+  const reconnectFactory = serverId ? () => requestSavedServerWebSocket(serverId) : undefined;
   terminal.connectWithWebSocket(ws, hostInfo, { reconnectFactory });
 }
 
@@ -299,13 +361,17 @@ function showSharedTerminal(claim: ClaimedShare): void {
   sharedSessionMode = true;
   isLoggedIn = false;
   document.getElementById('agent-toggle-btn')?.classList.add('hidden');
+  document.getElementById('snippet-toggle-btn')?.classList.add('hidden');
+  document.getElementById('mobile-snippets-btn')?.classList.add('hidden');
   const tabBar = document.getElementById('tab-bar');
   if (tabBar) tabBar.style.display = 'none';
-  const { terminal } = showTerminalWithNewTab(claim.serverName, claim.serverName);
+  const { terminal } = showTerminalWithNewTab(claim.serverName);
   terminal.mount();
   const socket = new WebSocket(claim.wsUrl);
   socket.binaryType = 'arraybuffer';
-  terminal.connectWithWebSocket(socket);
+  // 分享会话：仅允许秒级恢复（ticket 已一次性消费，完整重连不可能），
+  // 恢复彻底失败时在终端内宣告分享结束。
+  terminal.connectWithWebSocket(socket, undefined, { resumeOnly: true });
 }
 
 async function requestSavedServerWebSocket(serverId: number): Promise<WebSocket> {
@@ -313,12 +379,12 @@ async function requestSavedServerWebSocket(serverId: number): Promise<WebSocket>
   if (!response.ok) {
     const contentType = response.headers.get('content-type') || '';
     const message = contentType.includes('application/json')
-      ? (await response.json() as { error?: string }).error
+      ? ((await response.json()) as { error?: string }).error
       : null;
     throw new Error(message || `Connection failed (${response.status})`);
   }
 
-  const { wsUrl } = await response.json() as { wsUrl?: unknown };
+  const { wsUrl } = (await response.json()) as { wsUrl?: unknown };
   if (typeof wsUrl !== 'string' || !validateWsUrl(wsUrl)) {
     throw new Error(t('server.invalidWs'));
   }
@@ -340,6 +406,15 @@ document.getElementById('disconnect-btn')?.addEventListener('click', () => {
   tab.terminal.disconnect();
   tm.closeActiveTab();
 });
+
+// ==================== 命令片段库 ====================
+
+function openSnippetManager(): void {
+  void snippetManager.open();
+}
+
+document.getElementById('snippet-toggle-btn')?.addEventListener('click', openSnippetManager);
+document.getElementById('mobile-snippets-btn')?.addEventListener('click', openSnippetManager);
 
 // ==================== SFTP 面板 ====================
 
@@ -395,10 +470,10 @@ document.getElementById('export-btn')?.addEventListener('click', () => {
 const CUSTOM_THEME_VALUE = '__custom__';
 let themeSelectionRevision = 0;
 const themeSelectors = Array.from(
-  document.querySelectorAll<HTMLSelectElement>('[data-theme-selector]'),
+  document.querySelectorAll<HTMLSelectElement>('[data-theme-selector]')
 );
 
-themeSelectors.forEach((selector) => {
+for (const selector of themeSelectors) {
   selector.addEventListener('change', (e) => {
     themeSelectionRevision++;
     const value = (e.target as HTMLSelectElement).value;
@@ -408,7 +483,9 @@ themeSelectors.forEach((selector) => {
         try {
           const imported = normalizeImportedTheme(JSON.parse(importedRaw));
           if (imported) applyImportedTheme(imported);
-        } catch { /* ignore */ }
+        } catch {
+          /* ignore */
+        }
       }
     } else if (isBuiltInTheme(value)) {
       applyBuiltInTheme(value);
@@ -416,10 +493,10 @@ themeSelectors.forEach((selector) => {
     syncThemeSelectors(value);
     localStorage.setItem('cloudssh_theme_selection', value);
   });
-});
+}
 
 function ensureCustomOption(): void {
-  themeSelectors.forEach((selector) => {
+  for (const selector of themeSelectors) {
     let option = selector.querySelector<HTMLOptionElement>(`option[value="${CUSTOM_THEME_VALUE}"]`);
     if (!option) {
       option = document.createElement('option');
@@ -427,13 +504,13 @@ function ensureCustomOption(): void {
       selector.insertBefore(option, selector.firstChild);
     }
     option.textContent = t('theme.custom');
-  });
+  }
 }
 
 function syncThemeSelectors(value: string): void {
-  themeSelectors.forEach((selector) => {
+  for (const selector of themeSelectors) {
     selector.value = value;
-  });
+  }
 }
 
 // ==================== 主题导入 ====================
@@ -441,9 +518,9 @@ function syncThemeSelectors(value: string): void {
 const importThemeButtons = document.querySelectorAll<HTMLElement>('[data-theme-import]');
 const importThemeInput = document.getElementById('import-theme-input') as HTMLInputElement | null;
 
-importThemeButtons.forEach((button) => {
+for (const button of importThemeButtons) {
   button.addEventListener('click', () => importThemeInput?.click());
-});
+}
 
 importThemeInput?.addEventListener('change', (e) => {
   const file = (e.target as HTMLInputElement).files?.[0];
@@ -489,6 +566,14 @@ function restoreTheme(): void {
   const selection = localStorage.getItem('cloudssh_theme_selection');
   localStorage.removeItem('cloudssh_theme');
 
+  // glacier 内置主题已被 Apple 主题取代：旧选择一次性迁移到同为深色的 Standard Dark
+  if (selection === 'glacier') {
+    localStorage.setItem('cloudssh_theme_selection', 'standard-dark');
+    applyBuiltInTheme('standard-dark');
+    syncThemeSelectors('standard-dark');
+    return;
+  }
+
   if (isBuiltInTheme(selection)) {
     applyBuiltInTheme(selection);
     syncThemeSelectors(selection);
@@ -517,7 +602,9 @@ function restoreTheme(): void {
   syncThemeSelectors('cyberpunk');
 }
 
-async function saveThemeToCloud(theme: ReturnType<typeof normalizeImportedTheme>): Promise<boolean> {
+async function saveThemeToCloud(
+  theme: ReturnType<typeof normalizeImportedTheme>
+): Promise<boolean> {
   if (!theme) return false;
   try {
     const response = await fetch('/api/user/theme', {
@@ -537,12 +624,12 @@ async function saveThemeToCloud(theme: ReturnType<typeof normalizeImportedTheme>
  */
 async function restoreCloudTheme(
   initialSelection: string | null,
-  expectedSelectionRevision: number,
+  expectedSelectionRevision: number
 ): Promise<void> {
   try {
     const response = await fetch('/api/user/theme');
     if (!response.ok) return;
-    const payload = await response.json() as { theme?: unknown };
+    const payload = (await response.json()) as { theme?: unknown };
     const cloudTheme = normalizeImportedTheme(payload.theme);
 
     if (cloudTheme) {
@@ -574,6 +661,7 @@ async function init(): Promise<void> {
   initI18n();
   initUserSpaceMobileMenu();
   initServerPaginationBreakpoints();
+  bindBackToTerminalButtons();
   mobileTerminalController.start();
   onLocaleChange(() => {
     if (localStorage.getItem('cloudssh_imported_theme')) ensureCustomOption();

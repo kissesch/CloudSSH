@@ -16,11 +16,14 @@ export interface ToolDefinition {
     description: string;
     parameters: {
       type: 'object';
-      properties: Record<string, {
-        type: string;
-        description: string;
-        enum?: string[];
-      }>;
+      properties: Record<
+        string,
+        {
+          type: string;
+          description: string;
+          enum?: string[];
+        }
+      >;
       required?: string[];
     };
   };
@@ -42,8 +45,9 @@ export interface ChatCompletionResponse {
       role: 'assistant';
       content: string | null;
       tool_calls?: ToolCall[];
+      streamed?: boolean;
     };
-    finish_reason: 'stop' | 'tool_calls' | 'length';
+    finish_reason: string;
   }>;
   usage?: {
     prompt_tokens: number;

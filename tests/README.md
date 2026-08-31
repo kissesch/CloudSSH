@@ -10,12 +10,20 @@ tests/
 ├── e2e/                           # Chromium 浏览器交互与 axe 无障碍检查
 ├── ssh/                           # SSH 算法、认证、加密、KEX、Packet 与测试密钥夹具
 ├── worker/                        # Worker 路由、安全、DNS、UserDB 与标签测试
-├── agent-code-actions.test.ts     # Agent 代码块复制/填入规则
+├── agent-code-actions.test.ts # Agent 代码块复制/填入规则
 ├── agent-terminal-selection.test.ts # 终端选区附件和非授权安全边界
+├── api-errors.test.ts          # API 错误信息边界与状态码
+├── auth-challenge-dialog.test.ts # RFC 4256 认证挑战对话框交互
 ├── clipboard.test.ts              # Clipboard API 与旧版复制回退
-├── frontend-ux.test.ts            # 前端关键交互源码回归
+├── frontend-ux.test.ts            # 前端关键交互源码回归（标签栏/状态栏渲染等）
+├── host-display.test.ts           # IPv4/IPv6 掩码与完整地址复制
 ├── i18n.test.ts                   # 中英文词条和语言解析
+├── known-hosts.test.ts            # 已知主机指纹 TOFU 信任与变更流程
+├── mobile-input.test.ts           # iOS IME diff 与一次性修饰键帮助函数
+├── share-session.test.ts          # 分享会话确认/领取幂等与页面状态
 ├── sftp-selection.test.ts         # SFTP 单选、多选、连选和全选模型
+├── snippet-local-store.test.ts    # 匿名命令片段 localStorage 存储与限额
+├── snippet-schema.test.ts         # 片段名称/命令/数量校验与规范化
 ├── terminal-status.test.ts        # SSH 状态事件翻译
 ├── terminal-text.test.ts          # 终端文本处理
 ├── theme.test.ts                  # 内置/自定义主题
@@ -48,6 +56,12 @@ pnpm run test:e2e
 pnpm run verify
 ```
 
+> **测试类型检查**：`pnpm run typecheck` 的 worker 阶段会依次执行
+> `tsc --noEmit`（src）、`tsc -p tests/tsconfig.worker.json`（tests/worker|ssh|build，
+> workers-types 环境）与 `tsc -p tests/tsconfig.frontend.json`（tests 根目录 *.test.ts + e2e，
+> DOM 环境）。两个测试配置分开的原因：`@cloudflare/workers-types` 声明的基础 DOM 接口
+> （如 Element.append）与 DOM lib 合并冲突，不能在同一项目里同时加载。
+
 ## 当前覆盖范围
 
 ### SSH 协议
@@ -64,15 +78,17 @@ pnpm run verify
 - Origin 检查、端口范围、连接令牌和错误信息边界
 - IPv4/IPv6 保留地址、DoH 解析与 DNS rebinding 防护
 - Agent 危险命令拦截、确认规则和 SSRF URL 校验
-- UserDB 服务器标签迁移、规范化、序列化和更新
+- 主机密钥信任：首见指纹确认、更换指纹阻断与路由作用域隔离
+- 键盘交互认证、OS 检测、跳板链、SFTP 上传冲突、分享会话策略
+- UserDB 服务器标签/片段迁移、规范化、序列化、更新与隔离
 
 ### 前端与构建
 
-- 服务器搜索、标签筛选和每页 9 项分页
+- 服务器搜索、标签筛选和响应式分页（桌面 9 / 平板 6 / 移动 3）
 - SFTP 单选、Cmd/Ctrl 多选、Shift 连选和全选
 - Agent 终端选区附件、问题组合和非授权安全边界
 - 终端选区自动复制、指针取消和旧版复制回退
-- i18n、主题、终端状态和文本处理
+- i18n、Theme V3 主题（背景/效果/版式钳制、对比度与 schema）、终端状态/文本、已知主机与片段本地存储
 - 构建可复现性、xterm 生产构建兼容和原生弹窗禁用
 
 ### 浏览器 E2E
@@ -82,6 +98,8 @@ pnpm run verify
 - 服务器标签筛选与分页
 - Agent 终端选区附件
 - 终端选区复制与焦点恢复
+- 认证挑战对话框、iOS 输入法、移动端后台连接恢复与分享会话领取
+- SFTP 覆盖确认、主题样式与 UI 回归
 
 ## 当前限制
 

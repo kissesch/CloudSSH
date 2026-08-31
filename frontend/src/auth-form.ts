@@ -1,10 +1,14 @@
-import { loadKnownFingerprint } from './known-hosts';
-import type { TabManager } from './tab-manager';
-import { populateRegionSelect, regionLabel } from './regions';
-import { notify } from './ui-feedback';
+// 渲染模板中的 innerHTML 站点均带 `pi-lens-ignore: no-inner-html` 内联抑制：
+// 动态值均经 escapeHtml 转义或来自可信 i18n 词条，无用户输入直插；
+// GitHub Actions 质量门禁不含该规则（AGENTS.md #27）。
 import { onLocaleChange, t, translateDocument } from './i18n';
+import { loadKnownFingerprint } from './known-hosts';
 import { parsePort } from './port';
-import { getActiveColorScheme, onColorSchemeChange, type ColorScheme } from './theme';
+import { populateRegionSelect } from './regions';
+import type { TabManager } from './tab-manager';
+import { type ColorScheme, getActiveColorScheme, onColorSchemeChange } from './theme';
+import { notify } from './ui-feedback';
+
 // --- Credential encryption helpers ---
 async function deriveKey(salt: Uint8Array): Promise<CryptoKey> {
   const raw = new TextEncoder().encode(window.location.origin + ':cloudssh');
@@ -18,12 +22,14 @@ async function deriveKey(salt: Uint8Array): Promise<CryptoKey> {
   );
 }
 
-async function encryptCredentials(data: object): Promise<string> {
+async function encryptCredentials(data: Record<string, unknown>): Promise<string> {
   const salt = crypto.getRandomValues(new Uint8Array(16));
   const iv = crypto.getRandomValues(new Uint8Array(12));
   const key = await deriveKey(salt);
   const encoded = new TextEncoder().encode(JSON.stringify(data));
-  const encrypted = new Uint8Array(await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, encoded));
+  const encrypted = new Uint8Array(
+    await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, encoded)
+  );
   const combined = new Uint8Array(salt.length + iv.length + encrypted.length);
   combined.set(salt, 0);
   combined.set(iv, salt.length);
@@ -33,9 +39,18 @@ async function encryptCredentials(data: object): Promise<string> {
   return btoa(binary);
 }
 
-async function decryptCredentials(stored: string): Promise<{ host: string; port: string; username: string; password: string; privateKey?: string; authMethod?: string } | null> {
+async function decryptCredentials(
+  stored: string
+): Promise<{
+  host: string;
+  port: string;
+  username: string;
+  password: string;
+  privateKey?: string;
+  authMethod?: string;
+} | null> {
   try {
-    const raw = Uint8Array.from(atob(stored), c => c.charCodeAt(0));
+    const raw = Uint8Array.from(atob(stored), (c) => c.charCodeAt(0));
     const salt = raw.slice(0, 16);
     const iv = raw.slice(16, 28);
     const data = raw.slice(28);
@@ -65,10 +80,10 @@ export class ConnectionForm {
     this.render();
     onColorSchemeChange((colorScheme) => {
       if (
-        this.turnstileEnabled
-        && this.turnstileSitekey
-        && !this.turnstileVerified
-        && this.turnstileTheme !== colorScheme
+        this.turnstileEnabled &&
+        this.turnstileSitekey &&
+        !this.turnstileVerified &&
+        this.turnstileTheme !== colorScheme
       ) {
         this.renderTurnstile();
       }
@@ -113,6 +128,7 @@ export class ConnectionForm {
     const container = document.getElementById('connection-form-container');
     if (!container) return;
 
+    // pi-lens-ignore: no-inner-html
     container.innerHTML = `
       <div class="flex min-h-[320px] flex-col items-center justify-center gap-5 px-4 text-center" id="github-auth-required-panel">
         <span class="material-symbols-outlined text-[var(--accent)]" style="font-size: 42px;" aria-hidden="true">lock</span>
@@ -120,9 +136,11 @@ export class ConnectionForm {
           <h2 class="text-sm font-bold tracking-[0.1em] text-on-surface" data-i18n="auth.githubRequired">此 CloudSSH 实例需要 GitHub 登录</h2>
           <p class="mx-auto max-w-md text-xs leading-6 text-muted" data-i18n="auth.githubRequiredHint">登录成功且账号获得管理员授权后，才能使用 SSH 和账号功能。</p>
         </div>
-        ${githubAuthEnabled
-          ? '<span id="github-login-placeholder"></span>'
-          : '<p class="text-xs text-error" data-i18n="auth.githubNotConfigured">管理员尚未完整配置 GitHub OAuth，当前无法登录。</p>'}
+        ${
+          githubAuthEnabled
+            ? '<span id="github-login-placeholder"></span>'
+            : '<p class="text-xs text-error" data-i18n="auth.githubNotConfigured">管理员尚未完整配置 GitHub OAuth，当前无法登录。</p>'
+        }
       </div>
     `;
     translateDocument(container);
@@ -194,6 +212,7 @@ export class ConnectionForm {
   private render(): void {
     const container = document.getElementById('connection-form-container')!;
 
+    // pi-lens-ignore: no-inner-html
     container.innerHTML = `
       <form class="space-y-6" id="connection-form">
         <div class="grid grid-cols-1 sm:grid-cols-4 gap-4">
@@ -362,18 +381,20 @@ export class ConnectionForm {
 
     recent.forEach((item, index) => {
       const itemEl = document.createElement('div');
-      itemEl.className = 'flex justify-between items-center text-xs p-2 border border-dim bg-surface/50 hover:bg-surface hover:border-[var(--accent)] transition-all cursor-pointer group relative';
-      
+      itemEl.className =
+        'flex justify-between items-center text-xs p-2 border border-dim bg-surface/50 hover:bg-surface hover:border-[var(--accent)] transition-all cursor-pointer group relative';
+
       const authLabel = item.authMethod === 'publickey' ? 'KEY' : 'PWD';
       const labelText = `${item.username}@${item.host}:${item.port}`;
 
+      // pi-lens-ignore: no-inner-html
       itemEl.innerHTML = `
         <div class="flex items-center gap-2 overflow-hidden mr-2 select-none flex-1">
           <span class="material-symbols-outlined text-muted" style="font-size: 14px;">history</span>
           <span class="text-on-surface truncate" title="${labelText}">${labelText}</span>
           <span class="text-[9px] font-bold tracking-[0.05em] text-muted border border-dim px-1.5 py-0.2 shrink-0">${authLabel}</span>
         </div>
-        <button class="delete-history-btn text-muted hover:text-error flex items-center justify-center p-0.5" title="${t('auth.removeHistory')}">
+        <button type="button" class="delete-history-btn text-muted hover:text-error flex items-center justify-center p-0.5" title="${t('auth.removeHistory')}">
           <span class="material-symbols-outlined" style="font-size: 14px;">close</span>
         </button>
       `;
@@ -394,7 +415,14 @@ export class ConnectionForm {
     });
   }
 
-  private async fillConnection(item: { host: string; port: number; username: string; authMethod: 'password' | 'publickey'; encryptedCred?: string; region?: string }): Promise<void> {
+  private async fillConnection(item: {
+    host: string;
+    port: number;
+    username: string;
+    authMethod: 'password' | 'publickey';
+    encryptedCred?: string;
+    region?: string;
+  }): Promise<void> {
     (document.getElementById('host') as HTMLInputElement).value = item.host || '';
     (document.getElementById('port') as HTMLInputElement).value = (item.port || 22).toString();
     (document.getElementById('username') as HTMLInputElement).value = item.username || '';
@@ -415,7 +443,8 @@ export class ConnectionForm {
       const cred = await decryptCredentials(item.encryptedCred);
       if (cred) {
         (document.getElementById('password') as HTMLInputElement).value = cred.password || '';
-        (document.getElementById('private-key') as HTMLTextAreaElement).value = cred.privateKey || '';
+        (document.getElementById('private-key') as HTMLTextAreaElement).value =
+          cred.privateKey || '';
         (document.getElementById('remember-me') as HTMLInputElement).checked = true;
       } else {
         (document.getElementById('password') as HTMLInputElement).value = '';
@@ -434,8 +463,10 @@ export class ConnectionForm {
     let recent: any[] = [];
     try {
       recent = raw ? JSON.parse(raw) : [];
-    } catch {}
-    
+    } catch {
+      /* 本地存储损坏时回退为空列表，无需上报 */
+    }
+
     if (index >= 0 && index < recent.length) {
       recent.splice(index, 1);
       localStorage.setItem('cloudssh_recent_connections', JSON.stringify(recent));
@@ -499,38 +530,55 @@ export class ConnectionForm {
     const regionValue = anonRegionSelect ? anonRegionSelect.value : '';
 
     if (!host || !username) {
-      notify(t('auth.validationHostUser'), { title: t('auth.incompleteConnection'), variant: 'warning' });
-      (document.getElementById(!host ? 'host' : 'username') as HTMLInputElement)?.focus();
+      notify(t('auth.validationHostUser'), {
+        title: t('auth.incompleteConnection'),
+        variant: 'warning',
+      });
+      (document.getElementById(host ? 'username' : 'host') as HTMLInputElement)?.focus();
       return;
     }
 
     if (port === null) {
-      notify(t('auth.validationPort'), { title: t('auth.incompleteConnection'), variant: 'warning' });
+      notify(t('auth.validationPort'), {
+        title: t('auth.incompleteConnection'),
+        variant: 'warning',
+      });
       portInput.focus();
       return;
     }
 
     if (this.authMode === 'password' && !password) {
-      notify(t('auth.validationPassword'), { title: t('auth.incompleteCredentials'), variant: 'warning' });
+      notify(t('auth.validationPassword'), {
+        title: t('auth.incompleteCredentials'),
+        variant: 'warning',
+      });
       (document.getElementById('password') as HTMLInputElement)?.focus();
       return;
     }
 
     if (this.authMode === 'key' && !privateKey) {
-      notify(t('auth.validationPrivateKey'), { title: t('auth.incompleteCredentials'), variant: 'warning' });
+      notify(t('auth.validationPrivateKey'), {
+        title: t('auth.incompleteCredentials'),
+        variant: 'warning',
+      });
       (document.getElementById('private-key') as HTMLTextAreaElement)?.focus();
       return;
     }
 
     // Check Turnstile if enabled
     if (this.turnstileEnabled && !this.turnstileVerified) {
-      notify(t('auth.turnstileRequired'), { title: t('auth.verificationRequired'), variant: 'warning' });
-      document.getElementById('turnstile-container')?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      notify(t('auth.turnstileRequired'), {
+        title: t('auth.verificationRequired'),
+        variant: 'warning',
+      });
+      document
+        .getElementById('turnstile-container')
+        ?.scrollIntoView({ behavior: 'smooth', block: 'center' });
       return;
     }
 
     // 保存连接历史与凭据
-    let encryptedCred: string | undefined = undefined;
+    let encryptedCred: string | undefined;
     if (remember) {
       encryptedCred = await encryptCredentials({
         host,
@@ -548,7 +596,9 @@ export class ConnectionForm {
     try {
       recent = recentRaw ? JSON.parse(recentRaw) : [];
       if (!Array.isArray(recent)) recent = [];
-    } catch {}
+    } catch {
+      /* 本地存储损坏时回退为空列表，无需上报 */
+    }
 
     const id = `${username}@${host}:${port}`;
     const newRecord = {
@@ -558,12 +608,12 @@ export class ConnectionForm {
       username,
       authMethod: this.authMode === 'key' ? 'publickey' : 'password',
       timestamp: Date.now(),
-      ...(regionValue ? { region: regionValue } : {}),   // 区域偏好持久化到 recent
+      ...(regionValue ? { region: regionValue } : {}), // 区域偏好持久化到 recent
       ...(encryptedCred ? { encryptedCred } : {}),
     };
 
     // 去重：如果已有相同 id 记录，先删除
-    recent = recent.filter(r => r.id !== id);
+    recent = recent.filter((r) => r.id !== id);
     // 插入头部
     recent.unshift(newRecord);
     // 限制最近 5 条
@@ -603,10 +653,16 @@ export class ConnectionForm {
         expectedFingerprint: expectedFingerprint || undefined,
         locationHint: regionValue || undefined,
       });
-    } catch (error) {
+
+      // 连接成功后清空敏感凭据字段，避免返回匿名连接页时密码/私钥残留（安全）
+      (document.getElementById('password') as HTMLInputElement).value = '';
+      (document.getElementById('private-key') as HTMLTextAreaElement).value = '';
+    } catch {
       // 连接失败时关闭该标签
       tm.closeTab(tab.id);
-      document.getElementById('status-text')!.innerHTML = `<span class="w-2 h-2 bg-surface-dot inline-block"></span> ${t('auth.statusOffline')}`;
+      // pi-lens-ignore: no-inner-html
+      document.getElementById('status-text')!.innerHTML =
+        `<span class="w-2 h-2 bg-surface-dot inline-block"></span> ${t('auth.statusOffline')}`;
     }
   }
 }

@@ -105,12 +105,19 @@ export interface SSHJumpHostConfig {
  * 参考: https://developers.cloudflare.com/durable-objects/reference/data-location/
  */
 export const ALLOWED_LOCATION_HINTS = [
-  'wnam', 'enam', 'sam',
-  'weur', 'eeur',
-  'apac', 'apac-ne', 'apac-se',
-  'oc', 'afr', 'me',
+  'wnam',
+  'enam',
+  'sam',
+  'weur',
+  'eeur',
+  'apac',
+  'apac-ne',
+  'apac-se',
+  'oc',
+  'afr',
+  'me',
 ] as const;
-export type LocationHint = typeof ALLOWED_LOCATION_HINTS[number];
+export type LocationHint = (typeof ALLOWED_LOCATION_HINTS)[number];
 
 export interface TerminalSize {
   cols: number;
@@ -225,3 +232,26 @@ export const SSH_MSG_CHANNEL_CLOSE = 97;
 export const SSH_MSG_CHANNEL_REQUEST = 98;
 export const SSH_MSG_CHANNEL_SUCCESS = 99;
 export const SSH_MSG_CHANNEL_FAILURE = 100;
+
+export const SESSION_GRACE_PERIOD_MS = 60_000;
+export const SESSION_RING_BUFFER_MAX_BYTES = 128 * 1024;
+
+export interface SessionCreatedMessage {
+  type: 'session_created';
+  sessionId: string;
+  resumeToken: string;
+  expiresIn: number;
+  /** 该会话是否绑定了设备公钥（分享会话必须绑定才支持断线恢复）。 */
+  deviceBound?: boolean;
+  /** 是否允许断线自动恢复（分享会话未绑定设备时为 false，凭据为空串）。 */
+  resumeEnabled?: boolean;
+}
+
+export interface SessionResumedMessage {
+  type: 'session_resumed';
+  sessionId: string;
+  /** 每次成功恢复后轮换的新 resume token；旧 token 立即失效。 */
+  resumeToken?: string;
+  /** 断线期间保留的 SFTP attach URL，供前端在恢复后重建 SFTP 数据通道。 */
+  sftpAttachUrl?: string;
+}

@@ -1,4 +1,4 @@
-import { Env, UserInfo } from '../types';
+import type { Env, UserInfo } from '../types';
 
 /**
  * GitHub OAuth 流程处理 + Session 中间件
@@ -18,8 +18,13 @@ function parseCookies(request: Request): Record<string, string> {
 
 function getBaseUrl(env: Env, request: Request): string {
   if (env.BASE_URL) return env.BASE_URL.replace(/\/$/, '');
-  const url = new URL(request.url);
-  return `${url.protocol}//${url.host}`;
+  // request.url 由 Workers 运行时保证为合法绝对 URL；防御性兜底避免抛错。
+  try {
+    const url = new URL(request.url);
+    return `${url.protocol}//${url.host}`;
+  } catch {
+    return '';
+  }
 }
 
 // ==================== 获取 UserDBDO stub ====================
@@ -41,7 +46,7 @@ interface GitHubAccessPolicy {
  * - 已配置但为空：拒绝所有 GitHub 用户。
  * - 含非法值：配置无效并 fail closed，避免误开放实例。
  */
-export function getGitHubAccessPolicy(env: Env): GitHubAccessPolicy {
+function getGitHubAccessPolicy(env: Env): GitHubAccessPolicy {
   const raw = env.GITHUB_ALLOWED_USER_IDS;
   if (raw === undefined) {
     return { restricted: false, valid: true, allowedIds: new Set() };
@@ -103,11 +108,13 @@ export async function getAuthenticatedUser(request: Request, env: Env): Promise<
   if (!githubId) return null;
 
   const stub = getUserDBStub(env, githubId);
-  const res = await stub.fetch(new Request('http://internal/internal/session/verify', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ token: sessionToken }),
-  }));
+  const res = await stub.fetch(
+    new Request('http://internal/internal/session/verify', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ token: sessionToken }),
+    })
+  );
 
   if (!res.ok) return null;
   const user = await res.json<UserInfo>();
@@ -152,7 +159,13 @@ export async function handleGitHubCallback(request: Request, env: Env): Promise<
     return Response.json({ error: 'GitHub OAuth not configured' }, { status: 501 });
   }
 
-  const url = new URL(request.url);
+  // request.url 由 Workers 运行时保证为合法绝对 URL；防御性兜底避免抛出。
+  let url: URL;
+  try {
+    url = new URL(request.url);
+  } catch {
+    return new Response('Invalid callback URL', { status: 400 });
+  }
   const code = url.searchParams.get('code');
   const state = url.searchParams.get('state');
   const baseUrl = getBaseUrl(env, request);
@@ -216,32 +229,42 @@ export async function handleGitHubCallback(request: Request, env: Env): Promise<
 
   // 4. 创建/更新用户
   const stub = getUserDBStub(env, githubUser.id);
-  const userDbRes = await stub.fetch(new Request('http://internal/internal/oauth-user', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      github_id: githubUser.id,
-      username: githubUser.login,
-      avatar_url: githubUser.avatar_url,
-    }),
-  }));
+  const userDbRes = await stub.fetch(
+    new Request('http://internal/internal/oauth-user', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        github_id: githubUser.id,
+        username: githubUser.login,
+        avatar_url: githubUser.avatar_url,
+      }),
+    })
+  );
 
   const user = await userDbRes.json<UserInfo>();
 
   // 5. 创建 session
-  const sessionRes = await stub.fetch(new Request('http://internal/internal/session/create', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ user_id: user.id }),
-  }));
+  const sessionRes = await stub.fetch(
+    new Request('http://internal/internal/session/create', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ user_id: user.id }),
+    })
+  );
 
   const sessionData = await sessionRes.json<{ token: string }>();
 
   // 6. Set-Cookie + 重定向到首页
   const responseHeaders = new Headers();
   responseHeaders.set('Location', baseUrl || '/');
-  responseHeaders.append('Set-Cookie', `session=${sessionData.token}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=604800`);
-  responseHeaders.append('Set-Cookie', `oauth_state=; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=0`);
+  responseHeaders.append(
+    'Set-Cookie',
+    `session=${sessionData.token}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=604800`
+  );
+  responseHeaders.append(
+    'Set-Cookie',
+    `oauth_state=; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=0`
+  );
 
   return new Response(null, {
     status: 302,
@@ -262,11 +285,13 @@ export async function handleLogout(request: Request, env: Env): Promise<Response
       return Response.json({ success: true });
     }
     const stub = getUserDBStub(env, githubId);
-    await stub.fetch(new Request('http://internal/internal/session/delete', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ token: sessionToken }),
-    }));
+    await stub.fetch(
+      new Request('http://internal/internal/session/delete', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ token: sessionToken }),
+      })
+    );
   }
 
   return new Response(JSON.stringify({ success: true }), {

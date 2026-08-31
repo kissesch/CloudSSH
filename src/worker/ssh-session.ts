@@ -1,61 +1,67 @@
-import { SSHConnectionConfig, SessionKeys, SSHPacket, TerminalSize, normalizeTerminalSize } from '../types';
-import {
-  SSH_MSG_KEXINIT,
-  SSH_MSG_NEWKEYS,
-  SSH_MSG_KEX_ECDH_REPLY,
-  SSH_MSG_SERVICE_REQUEST,
-  SSH_MSG_SERVICE_ACCEPT,
-  SSH_MSG_EXT_INFO,
-  SSH_MSG_USERAUTH_SUCCESS,
-  SSH_MSG_USERAUTH_FAILURE,
-  SSH_MSG_USERAUTH_INFO_REQUEST,
-  SSH_MSG_GLOBAL_REQUEST,
-  SSH_MSG_REQUEST_FAILURE,
-  SSH_MSG_REQUEST_SUCCESS,
-  SSH_MSG_CHANNEL_OPEN_CONFIRMATION,
-  SSH_MSG_CHANNEL_OPEN_FAILURE,
-  SSH_MSG_CHANNEL_SUCCESS,
-  SSH_MSG_CHANNEL_FAILURE,
-  SSH_MSG_CHANNEL_DATA,
-  SSH_MSG_CHANNEL_EXTENDED_DATA,
-  SSH_MSG_CHANNEL_WINDOW_ADJUST,
-  SSH_MSG_CHANNEL_EOF,
-  SSH_MSG_CHANNEL_CLOSE,
-  SSH_MSG_CHANNEL_REQUEST,
-  SSH_MSG_DISCONNECT,
-  SSH_MSG_IGNORE,
-  SSH_MSG_DEBUG,
-  SSH_MSG_UNIMPLEMENTED,
-} from '../types';
-import { SSHTransport } from '../ssh/transport';
-import { SSHPacketParser, SSHPacketBuilder, nextSequenceNumber } from '../ssh/packet';
-import {
-  KEXInitBuilder,
-  parseKEXInit,
-  negotiate,
-  parseServerSigAlgs,
-  filterExtInfo,
-} from '../ssh/kex';
 import {
   getCipherSpec,
   getMacAlgorithmsForCipher,
   getMacSpec,
+  isCurve25519KEXAlgorithm,
   KEX_ALGORITHM_ECDH_NISTP256,
-  isCurve25519KEXAlgorithm
 } from '../ssh/algorithms';
-import { ECDHKeyExchange } from '../ssh/kex-ecdh';
-import { Curve25519KeyExchange, Curve25519KeyPair } from '../ssh/kex-curve25519';
-import { KeyDerivation } from '../ssh/keys';
-import { SSHAESCTRCipher, SSHAESGCMCipher, SSHHMAC } from '../ssh/crypto';
 import { SSHAuth } from '../ssh/auth';
-import { SSHChannel, type ChannelDataChunk } from '../ssh/channel';
-import { SFTPHandler } from './sftp-handler';
-import { DETECT_OS_COMMAND, isDetectedOS, parseDetectedOS } from './os-detect';
-import { AgentCore } from './agent/core';
-import { TerminalContext } from './agent/terminal-context';
-import { AgentExecChannel } from './agent/exec-channel';
-import { DirectTcpipStream } from './direct-tcpip-stream';
+import { type ChannelDataChunk, SSHChannel } from '../ssh/channel';
+import { SSHAESCTRCipher, SSHAESGCMCipher, SSHHMAC } from '../ssh/crypto';
+import {
+  filterExtInfo,
+  KEXInitBuilder,
+  negotiate,
+  parseKEXInit,
+  parseServerSigAlgs,
+} from '../ssh/kex';
+import { Curve25519KeyExchange, type Curve25519KeyPair } from '../ssh/kex-curve25519';
+import { ECDHKeyExchange } from '../ssh/kex-ecdh';
+import { KeyDerivation } from '../ssh/keys';
+import { nextSequenceNumber, SSHPacketBuilder, SSHPacketParser } from '../ssh/packet';
+import { SSHTransport } from '../ssh/transport';
 import type { Env } from '../types';
+import {
+  normalizeTerminalSize,
+  SESSION_RING_BUFFER_MAX_BYTES,
+  type SessionKeys,
+  type SSHSessionPolicy,
+  SSH_MSG_CHANNEL_CLOSE,
+  SSH_MSG_CHANNEL_DATA,
+  SSH_MSG_CHANNEL_EOF,
+  SSH_MSG_CHANNEL_EXTENDED_DATA,
+  SSH_MSG_CHANNEL_FAILURE,
+  SSH_MSG_CHANNEL_OPEN_CONFIRMATION,
+  SSH_MSG_CHANNEL_OPEN_FAILURE,
+  SSH_MSG_CHANNEL_REQUEST,
+  SSH_MSG_CHANNEL_SUCCESS,
+  SSH_MSG_CHANNEL_WINDOW_ADJUST,
+  SSH_MSG_DEBUG,
+  SSH_MSG_DISCONNECT,
+  SSH_MSG_EXT_INFO,
+  SSH_MSG_GLOBAL_REQUEST,
+  SSH_MSG_IGNORE,
+  SSH_MSG_KEX_ECDH_REPLY,
+  SSH_MSG_KEXINIT,
+  SSH_MSG_NEWKEYS,
+  SSH_MSG_REQUEST_FAILURE,
+  SSH_MSG_REQUEST_SUCCESS,
+  SSH_MSG_SERVICE_ACCEPT,
+  SSH_MSG_SERVICE_REQUEST,
+  SSH_MSG_UNIMPLEMENTED,
+  SSH_MSG_USERAUTH_FAILURE,
+  SSH_MSG_USERAUTH_INFO_REQUEST,
+  SSH_MSG_USERAUTH_SUCCESS,
+  type SSHConnectionConfig,
+  type SSHPacket,
+  type TerminalSize,
+} from '../types';
+import { AgentCore } from './agent/core';
+import { AgentExecChannel } from './agent/exec-channel';
+import { TerminalContext } from './agent/terminal-context';
+import { DirectTcpipStream } from './direct-tcpip-stream';
+import { DETECT_OS_COMMAND, isDetectedOS, parseDetectedOS } from './os-detect';
+import { SFTPHandler } from './sftp-handler';
 
 const LOCAL_WINDOW_ADJUST_THRESHOLD = 512 * 1024;
 const KEEPALIVE_REQUEST_NAME = new TextEncoder().encode('keepalive@openssh.com');
@@ -67,6 +73,16 @@ const MAX_PARTIAL_AUTHENTICATION_STAGES = 8;
 // when the terminal output consists entirely of four-byte Unicode characters.
 const SHARE_AUDIT_FLUSH_CHARS = 8 * 1024;
 const SHARE_AUDIT_FLUSH_MS = 1000;
+// Socket 写超时（write deadline）：弱网 TCP 半开时 write() 可能永不 settle，
+// 超时即关闭底层 socket 会拒绝所有 pending 写，读循环随之走正常 close() 流程。
+const SOCKET_WRITE_TIMEOUT_MS = 15_000;
+// 被动存活看门狗：只依据最后入站数据时间戳（不依赖可能挂死的写路径），
+// 链路死亡时可靠地终结僵尸会话。keepalive 每 25s 触发一次服务器应答，
+// 60s 宽限 > 2 个 keepalive 周期，正常会话不会误杀。
+const IDLE_WATCHDOG_CHECK_MS = 10_000;
+const IDLE_WATCHDOG_GRACE_MS = 60_000;
+// 浏览器→服务器终端输入队列上限：浏览器卡死时防止 channelDataQueue 无界堆积。
+const MAX_INPUT_QUEUE_BYTES = 4 * 1024 * 1024;
 
 type ActiveAuthMethod = 'none' | 'password' | 'publickey' | 'keyboard-interactive';
 
@@ -118,6 +134,7 @@ export class SSHSession {
   private channelDataQueue: Uint8Array[] = [];
   private channelDataQueueHead: number = 0;
   private channelDataQueueOffset: number = 0;
+  private channelDataQueueBytes: number = 0;
   private channelDataFlushInProgress: boolean = false;
 
   private kexInitLocal: Uint8Array | null = null;
@@ -141,8 +158,15 @@ export class SSHSession {
   private partialAuthenticationStages: number = 0;
   private pendingAuthChallenge: PendingAuthChallenge | null = null;
 
-  private state: 'connecting' | 'version' | 'kex' | 'auth' | 'tunnel-ready' | 'shell' | 'shell-requested' | 'ready'
-    = 'connecting';
+  private state:
+    | 'connecting'
+    | 'version'
+    | 'kex'
+    | 'auth'
+    | 'tunnel-ready'
+    | 'shell'
+    | 'shell-requested'
+    | 'ready' = 'connecting';
   private hostKeyFingerprint: string = '';
   private hostKeyType: string = 'unknown';
 
@@ -157,6 +181,8 @@ export class SSHSession {
   private readonly maxKeepaliveFails: number = 3;
   private keepalivePending: boolean = false;
   private keepaliveTimeout: ReturnType<typeof setTimeout> | null = null;
+  private lastPacketAt: number = Date.now();
+  private idleWatchdogInterval: ReturnType<typeof setInterval> | null = null;
   private shellReadyTimeout: ReturnType<typeof setTimeout> | null = null;
   private terminalSize: TerminalSize = { cols: 120, rows: 40 };
   private debugMode: boolean = false;
@@ -166,11 +192,14 @@ export class SSHSession {
   private agentCore: AgentCore | null = null;
   private activeExecChannels: Map<number, AgentExecChannel> = new Map();
   private directTcpipStreams: Map<number, DirectTcpipStream> = new Map();
-  private pendingDirectTcpip: Map<number, {
-    resolve: (stream: DirectTcpipStream) => void;
-    reject: (error: Error) => void;
-    timeout: ReturnType<typeof setTimeout>;
-  }> = new Map();
+  private pendingDirectTcpip: Map<
+    number,
+    {
+      resolve: (stream: DirectTcpipStream) => void;
+      reject: (error: Error) => void;
+      timeout: ReturnType<typeof setTimeout>;
+    }
+  > = new Map();
   private channelWindowWaiters: Map<number, Array<() => void>> = new Map();
   private confirmationResolve: ((approved: boolean) => void) | null = null;
   private env: Env | null = null;
@@ -184,6 +213,7 @@ export class SSHSession {
   private shareAuditStarted = false;
   private shareAuditClosed = false;
   private shareSessionExpiryTimer: ReturnType<typeof setTimeout> | null = null;
+  private shareExpiryWarningTimer: ReturnType<typeof setTimeout> | null = null;
   private sftpAuditContext = new Map<string, Record<string, unknown>>();
   private readonly openShellOnAuth: boolean;
   private readonly ownsWebSocket: boolean;
@@ -194,6 +224,11 @@ export class SSHSession {
   private readonly authenticatedPromise: Promise<void>;
   private authenticatedSettled = false;
   private closed = false;
+  private detached: boolean = false;
+  private detachedOutputBuffer: Uint8Array[] = [];
+  private detachedBufferBytes: number = 0;
+  private unadjustedDetachedBytes: number = 0;
+  private static readonly MAX_DETACHED_BUFFER_BYTES = SESSION_RING_BUFFER_MAX_BYTES;
 
   constructor(
     ws: WebSocket,
@@ -205,7 +240,7 @@ export class SSHSession {
     env?: Env,
     userId?: string,
     githubId?: string,
-    options: SSHSessionOptions = {},
+    options: SSHSessionOptions = {}
   ) {
     this.ws = ws;
     this.socket = socket;
@@ -248,8 +283,9 @@ export class SSHSession {
   }
 
   belongsToShare(shareId: string): boolean {
-    return this.config.sessionPolicy?.source === 'share'
-      && this.config.sessionPolicy.shareId === shareId;
+    return (
+      this.config.sessionPolicy?.source === 'share' && this.config.sessionPolicy.shareId === shareId
+    );
   }
 
   /** Open an RFC 4254 direct-tcpip byte stream through an authenticated hop. */
@@ -268,7 +304,7 @@ export class SSHSession {
     const stream = new DirectTcpipStream(
       (data) => this.sendDirectTcpipData(channelID, channel, data),
       () => this.closeDirectTcpipChannel(channelID, channel),
-      (bytes) => this.queueLocalWindowAdjust(bytes, channel),
+      (bytes) => this.queueLocalWindowAdjust(bytes, channel)
     );
     this.directTcpipStreams.set(channelID, stream);
 
@@ -299,10 +335,18 @@ export class SSHSession {
 
   attachSFTPWebSocket(ws: WebSocket): void {
     if (this.sftpWs && this.sftpWs !== ws) {
-      try { this.sftpWs.close(1000, 'Replaced by new SFTP WebSocket'); } catch (e) { this.sendDebug(() => `Close old SFTP ws: ${e instanceof Error ? e.message : e}`); }
+      try {
+        this.sftpWs.close(1000, 'Replaced by new SFTP WebSocket');
+      } catch (e) {
+        this.sendDebug(() => `Close old SFTP ws: ${e instanceof Error ? e.message : e}`);
+      }
     }
     this.sftpWs = ws;
-    try { ws.send(JSON.stringify({ type: 'sftp_socket_ready' })); } catch (e) { this.sendDebug(() => `Send sftp_socket_ready failed: ${e instanceof Error ? e.message : e}`); }
+    try {
+      ws.send(JSON.stringify({ type: 'sftp_socket_ready' }));
+    } catch (e) {
+      this.sendDebug(() => `Send sftp_socket_ready failed: ${e instanceof Error ? e.message : e}`);
+    }
   }
 
   detachSFTPWebSocket(ws: WebSocket, closeChannel: boolean = true): void {
@@ -335,6 +379,9 @@ export class SSHSession {
           value = result.value;
         }
 
+        // 被动存活看门狗：任何入站数据都刷新最后活动时间戳（与写路径解耦）
+        this.lastPacketAt = Date.now();
+
         if (this.state === 'version') {
           const merged = new Uint8Array(this.versionRawBuffer.length + value.length);
           merged.set(this.versionRawBuffer);
@@ -366,7 +413,7 @@ export class SSHSession {
             if (lineStr.endsWith('\r')) lineStr = lineStr.slice(0, -1);
 
             if (lineStr.startsWith('SSH-')) {
-              this.transport.handleVersionExchange(lineStr + '\r\n');
+              this.transport.handleVersionExchange(`${lineStr}\r\n`);
               remaining = this.versionRawBuffer.subarray(scanOffset);
               versionFound = true;
               break;
@@ -384,10 +431,8 @@ export class SSHSession {
               this.packetParser.feed(remaining);
               await this.processPackets();
             }
-          } else {
-            if (scanOffset > 0) {
-              this.versionRawBuffer = this.versionRawBuffer.subarray(scanOffset);
-            }
+          } else if (scanOffset > 0) {
+            this.versionRawBuffer = this.versionRawBuffer.subarray(scanOffset);
           }
         } else {
           this.packetParser.feed(value);
@@ -397,8 +442,10 @@ export class SSHSession {
     } catch (error) {
       const errMsg = error instanceof Error ? error.message : String(error);
       try {
-        this.ws.send(JSON.stringify({ type: 'error', message: 'SSH 连接异常: ' + errMsg }));
-      } catch (e) { this.sendDebug(() => `Send error to client failed: ${e instanceof Error ? e.message : e}`); }
+        this.ws.send(JSON.stringify({ type: 'error', message: `SSH 连接异常: ${errMsg}` }));
+      } catch (e) {
+        this.sendDebug(() => `Send error to client failed: ${e instanceof Error ? e.message : e}`);
+      }
       this.close();
     }
   }
@@ -406,9 +453,7 @@ export class SSHSession {
   private async startKEX(): Promise<void> {
     this.kexInitLocal = KEXInitBuilder.build();
 
-    const packet = await SSHPacketBuilder.build(
-      this.kexInitLocal, 8, null, this.seqNumSend
-    );
+    const packet = await SSHPacketBuilder.build(this.kexInitLocal, 8, null, this.seqNumSend);
     this.seqNumSend = nextSequenceNumber(this.seqNumSend);
     await this.writeSocket(packet);
   }
@@ -433,18 +478,40 @@ export class SSHSession {
       throw new Error(`Unsupported KEX algorithm: ${this.negotiatedKexAlgorithm}`);
     }
 
-    const packet = await SSHPacketBuilder.build(
-      kexInit, 8, null, this.seqNumSend
-    );
+    const packet = await SSHPacketBuilder.build(kexInit, 8, null, this.seqNumSend);
     this.seqNumSend = nextSequenceNumber(this.seqNumSend);
     await this.writeSocket(packet);
   }
 
+  /**
+   * write deadline：弱网 TCP 半开时底层 write 可能永不 settle，导致 sendMutex
+   * 链条整体卡死（keepalive、窗口调整、Agent 通道关闭全部失效）。
+   * 超时即关闭底层 socket —— pending 写会立刻被拒绝，读循环收到关闭事件后
+   * 走正常 close() 流程，会话不会僵死。
+   */
   private async writeSocket(data: Uint8Array): Promise<void> {
     if (!this.socketWriter) {
       this.socketWriter = this.socket.writable.getWriter();
     }
-    await this.socketWriter!.write(data);
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await Promise.race([
+        this.socketWriter!.write(data),
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(() => {
+            this.sendDebug('Socket write timeout — closing TCP socket');
+            try {
+              this.socket.close();
+            } catch {
+              /* socket already closed */
+            }
+            reject(new Error('Socket write timeout'));
+          }, SOCKET_WRITE_TIMEOUT_MS);
+        }),
+      ]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
   }
 
   private async buildEncryptedPacket(payload: Uint8Array): Promise<Uint8Array> {
@@ -459,15 +526,16 @@ export class SSHSession {
       (data, seq, aad) => this.encryptCipher!.encrypt(data, seq, aad),
       this.seqNumSend,
       cipher.aead,
-      this.encryptMac
-        ? (packetData, seq) => this.encryptMac!.sign(packetData, seq)
-        : undefined
+      this.encryptMac ? (packetData, seq) => this.encryptMac!.sign(packetData, seq) : undefined
     );
     this.seqNumSend = nextSequenceNumber(this.seqNumSend);
     return packet;
   }
 
-  private async buildEncryptedChannelDataPacket(chunk: ChannelDataChunk, channel: SSHChannel): Promise<Uint8Array> {
+  private async buildEncryptedChannelDataPacket(
+    chunk: ChannelDataChunk,
+    channel: SSHChannel
+  ): Promise<Uint8Array> {
     if (!this.encryptCipher) {
       throw new Error('Encryption not initialized');
     }
@@ -475,20 +543,19 @@ export class SSHSession {
     const cipher = getCipherSpec(this.negotiatedCipherC2S);
     const packet = await SSHPacketBuilder.buildWithPayloadWriter(
       chunk.payloadLength,
-      (packet, offset) => channel.writeChannelDataPayload(
-        packet,
-        offset,
-        chunk.source,
-        chunk.sourceOffset,
-        chunk.bytesConsumed
-      ),
+      (packet, offset) =>
+        channel.writeChannelDataPayload(
+          packet,
+          offset,
+          chunk.source,
+          chunk.sourceOffset,
+          chunk.bytesConsumed
+        ),
       cipher.blockSize,
       (data, seq, aad) => this.encryptCipher!.encrypt(data, seq, aad),
       this.seqNumSend,
       cipher.aead,
-      this.encryptMac
-        ? (packetData, seq) => this.encryptMac!.sign(packetData, seq)
-        : undefined
+      this.encryptMac ? (packetData, seq) => this.encryptMac!.sign(packetData, seq) : undefined
     );
     this.seqNumSend = nextSequenceNumber(this.seqNumSend);
     return packet;
@@ -505,9 +572,13 @@ export class SSHSession {
       const cipher = this.decryptCipher ? getCipherSpec(this.negotiatedCipherS2C) : null;
       const blockSize = cipher ? cipher.blockSize : 8;
       const hasAuthTag = !!cipher?.aead;
-      const macLength = this.decryptCipher && !hasAuthTag ? getMacSpec(this.negotiatedMacS2C).length : 0;
+      const macLength =
+        this.decryptCipher && !hasAuthTag ? getMacSpec(this.negotiatedMacS2C).length : 0;
       const hasDecrypt = !!this.decryptCipher;
-      this.sendDebug(() => `processPackets: blockSize=${blockSize}, hasDecrypt=${hasDecrypt}, bufferLen=${this.packetParser.getBufferLength()}`);
+      this.sendDebug(
+        () =>
+          `processPackets: blockSize=${blockSize}, hasDecrypt=${hasDecrypt}, bufferLen=${this.packetParser.getBufferLength()}`
+      );
 
       try {
         const packet = await this.packetParser.nextPacket(
@@ -523,16 +594,21 @@ export class SSHSession {
         );
 
         if (!packet) {
-          this.sendDebug(() => `No more packets, buffer remaining: ${this.packetParser.getBufferLength()}`);
+          this.sendDebug(
+            () => `No more packets, buffer remaining: ${this.packetParser.getBufferLength()}`
+          );
           break;
         }
 
-        this.sendDebug(() => `Received msgType=${packet.payload[0]}, state=${this.state}, payloadLen=${packet.payload.length}`);
+        this.sendDebug(
+          () =>
+            `Received msgType=${packet.payload[0]}, state=${this.state}, payloadLen=${packet.payload.length}`
+        );
         await this.handlePacket(packet);
       } catch (e) {
         const errMsg = e instanceof Error ? e.message : String(e);
         this.sendDebug(`processPackets ERROR: ${errMsg}`);
-        this.sendError('数据包处理异常: ' + errMsg, 'packet_error', { message: errMsg });
+        this.sendError(`数据包处理异常: ${errMsg}`, 'packet_error', { message: errMsg });
         this.close();
         return;
       }
@@ -548,7 +624,11 @@ export class SSHSession {
       this.close(true);
       return;
     }
-    if (msgType === SSH_MSG_IGNORE || msgType === SSH_MSG_DEBUG || msgType === SSH_MSG_UNIMPLEMENTED) {
+    if (
+      msgType === SSH_MSG_IGNORE ||
+      msgType === SSH_MSG_DEBUG ||
+      msgType === SSH_MSG_UNIMPLEMENTED
+    ) {
       return;
     }
     if (msgType === SSH_MSG_GLOBAL_REQUEST) {
@@ -591,8 +671,11 @@ export class SSHSession {
     //   boolean   want_reply
     //   ...       request-specific data
     let offset = 1;
-    const nameLen = (payload[offset] << 24) | (payload[offset+1] << 16) |
-                    (payload[offset+2] << 8) | payload[offset+3];
+    const nameLen =
+      (payload[offset] << 24) |
+      (payload[offset + 1] << 16) |
+      (payload[offset + 2] << 8) |
+      payload[offset + 3];
     offset += 4;
     const requestName = this.textDecoder.decode(payload.subarray(offset, offset + nameLen));
     offset += nameLen;
@@ -617,6 +700,7 @@ export class SSHSession {
   private startKeepalive(): void {
     this.keepaliveFailCount = 0;
     this.keepalivePending = false;
+    this.startIdleWatchdog();
     this.keepaliveInterval = setInterval(async () => {
       if (this.keepalivePending) {
         this.keepaliveFailCount++;
@@ -642,7 +726,9 @@ export class SSHSession {
         this.keepaliveTimeout = setTimeout(() => {
           if (this.keepalivePending) {
             this.keepaliveFailCount++;
-            this.sendDebug(`Keepalive response timeout (${this.keepaliveFailCount}/${this.maxKeepaliveFails})`);
+            this.sendDebug(
+              `Keepalive response timeout (${this.keepaliveFailCount}/${this.maxKeepaliveFails})`
+            );
             this.keepalivePending = false;
             if (this.keepaliveFailCount >= this.maxKeepaliveFails) {
               this.sendError('SSH 连接超时，保活失败', 'keepalive_timeout');
@@ -652,13 +738,31 @@ export class SSHSession {
         }, 10000);
       } catch (e) {
         this.keepaliveFailCount++;
-        this.sendDebug(`Keepalive send failed (${this.keepaliveFailCount}/${this.maxKeepaliveFails}): ${e instanceof Error ? e.message : String(e)}`);
+        this.sendDebug(
+          `Keepalive send failed (${this.keepaliveFailCount}/${this.maxKeepaliveFails}): ${e instanceof Error ? e.message : String(e)}`
+        );
         if (this.keepaliveFailCount >= this.maxKeepaliveFails) {
           this.sendError('SSH 连接超时，保活失败', 'keepalive_timeout');
           this.close();
         }
       }
     }, 25000);
+  }
+
+  /**
+   * 被动存活看门狗：只依赖 startReading 维护的 lastPacketAt，完全不经过写路径 ——
+   * 主动 keepalive 会因 sendMutex 卡死而先于会话失效，此计时器独立工作，
+   * 在宽限期后可靠地终结僵尸会话，避免其耗尽 DO 资源。
+   */
+  private startIdleWatchdog(): void {
+    if (this.idleWatchdogInterval) return;
+    this.lastPacketAt = Date.now();
+    this.idleWatchdogInterval = setInterval(() => {
+      if (Date.now() - this.lastPacketAt > IDLE_WATCHDOG_GRACE_MS) {
+        this.sendError('SSH 连接无响应，已自动断开（空闲超时）', 'idle_timeout');
+        this.close();
+      }
+    }, IDLE_WATCHDOG_CHECK_MS);
   }
 
   private async handleKEXPacket(msgType: number, payload: Uint8Array): Promise<void> {
@@ -681,19 +785,37 @@ export class SSHSession {
             filterExtInfo(serverKex.kexAlgorithms),
             'KEX algorithm'
           );
-          this.negotiatedCipherC2S = negotiate(clientKex.encryptionC2S, serverKex.encryptionC2S, 'C2S cipher');
-          this.negotiatedCipherS2C = negotiate(clientKex.encryptionS2C, serverKex.encryptionS2C, 'S2C cipher');
+          this.negotiatedCipherC2S = negotiate(
+            clientKex.encryptionC2S,
+            serverKex.encryptionC2S,
+            'C2S cipher'
+          );
+          this.negotiatedCipherS2C = negotiate(
+            clientKex.encryptionS2C,
+            serverKex.encryptionS2C,
+            'S2C cipher'
+          );
           this.negotiatedMacC2S = getCipherSpec(this.negotiatedCipherC2S).aead
             ? 'none'
-            : negotiate(getMacAlgorithmsForCipher(this.negotiatedCipherC2S), serverKex.macC2S, 'C2S MAC');
+            : negotiate(
+                getMacAlgorithmsForCipher(this.negotiatedCipherC2S),
+                serverKex.macC2S,
+                'C2S MAC'
+              );
           this.negotiatedMacS2C = getCipherSpec(this.negotiatedCipherS2C).aead
             ? 'none'
-            : negotiate(getMacAlgorithmsForCipher(this.negotiatedCipherS2C), serverKex.macS2C, 'S2C MAC');
-          this.sendDebug(`Negotiated KEX: ${this.negotiatedKexAlgorithm}, C2S: ${this.negotiatedCipherC2S}/${this.negotiatedMacC2S}, S2C: ${this.negotiatedCipherS2C}/${this.negotiatedMacS2C}`);
+            : negotiate(
+                getMacAlgorithmsForCipher(this.negotiatedCipherS2C),
+                serverKex.macS2C,
+                'S2C MAC'
+              );
+          this.sendDebug(
+            `Negotiated KEX: ${this.negotiatedKexAlgorithm}, C2S: ${this.negotiatedCipherC2S}/${this.negotiatedMacC2S}, S2C: ${this.negotiatedCipherS2C}/${this.negotiatedMacS2C}`
+          );
           await this.sendKEXECDHInit();
         } catch (e) {
           const errMsg = e instanceof Error ? e.message : String(e);
-          this.sendError('算法协商失败: ' + errMsg, 'algorithm_error', { message: errMsg });
+          this.sendError(`算法协商失败: ${errMsg}`, 'algorithm_error', { message: errMsg });
           this.close();
         }
         break;
@@ -707,9 +829,7 @@ export class SSHSession {
       case SSH_MSG_NEWKEYS: {
         this.sendDebug(`Received NEWKEYS, seqNumSend=${this.seqNumSend}`);
         const newKeys = new Uint8Array([SSH_MSG_NEWKEYS]);
-        const packet = await SSHPacketBuilder.build(
-          newKeys, 8, null, this.seqNumSend
-        );
+        const packet = await SSHPacketBuilder.build(newKeys, 8, null, this.seqNumSend);
         this.seqNumSend = nextSequenceNumber(this.seqNumSend);
         await this.writeSocket(packet);
         this.sendDebug(`Client NEWKEYS sent, seqNumSend=${this.seqNumSend}`);
@@ -724,7 +844,7 @@ export class SSHSession {
         } catch (e) {
           const errMsg = e instanceof Error ? e.message : String(e);
           this.sendDebug(`SERVICE_REQUEST failed: ${errMsg}`);
-          this.sendError('SERVICE_REQUEST 失败: ' + errMsg, 'service_error', { message: errMsg });
+          this.sendError(`SERVICE_REQUEST 失败: ${errMsg}`, 'service_error', { message: errMsg });
           this.close();
         }
         break;
@@ -742,9 +862,10 @@ export class SSHSession {
 
   private async handleECDHReply(payload: Uint8Array): Promise<void> {
     this.sendDebug('Parsing ECDH_REPLY...');
-    const { hostKey, serverRawPublicKey, signature } =
-      ECDHKeyExchange.parseReply(payload);
-    this.sendDebug(`ECDH_REPLY parsed: hostKey=${hostKey.length}, serverPubKey=${serverRawPublicKey.length}, sig=${signature.length}`);
+    const { hostKey, serverRawPublicKey, signature } = ECDHKeyExchange.parseReply(payload);
+    this.sendDebug(
+      `ECDH_REPLY parsed: hostKey=${hostKey.length}, serverPubKey=${serverRawPublicKey.length}, sig=${signature.length}`
+    );
 
     if (!this.negotiatedKexAlgorithm || !this.kexRawPublicKey) {
       throw new Error('KEX reply received before KEX init was sent');
@@ -793,7 +914,9 @@ export class SSHSession {
           serverRawPublicKey,
           sharedSecret
         );
-    const hHex = Array.from(H).map(b => b.toString(16).padStart(2, '0')).join('');
+    const hHex = Array.from(H)
+      .map((b) => b.toString(16).padStart(2, '0'))
+      .join('');
     this.sendDebug(`Exchange hash H=${hHex}`);
 
     // Extract host key algorithm type from the blob
@@ -806,7 +929,7 @@ export class SSHSession {
 
     // Compute host key fingerprint (SHA-256)
     const fpHash = new Uint8Array(await crypto.subtle.digest('SHA-256', hostKey));
-    this.hostKeyFingerprint = 'SHA256:' + btoa(String.fromCharCode(...fpHash)).replace(/=+$/, '');
+    this.hostKeyFingerprint = `SHA256:${btoa(String.fromCharCode(...fpHash)).replace(/=+$/, '')}`;
     this.sendDebug(`Host key fingerprint: ${this.hostKeyFingerprint} (${this.hostKeyType})`);
 
     // Verify possession of the presented host key before comparing or persisting its fingerprint.
@@ -825,18 +948,26 @@ export class SSHSession {
         this.sendDebug(`Host key signature verification: ${sigVerified ? 'PASS' : 'FAIL'}`);
         if (!sigVerified) {
           if (this.strictHostKeyVerify) {
-            this.sendError('主机密钥签名验证失败，连接被阻断。如需跳过，请设置 STRICT_HOST_KEY_VERIFY=false', 'host_key_signature_blocked');
+            this.sendError(
+              '主机密钥签名验证失败，连接被阻断。如需跳过，请设置 STRICT_HOST_KEY_VERIFY=false',
+              'host_key_signature_blocked'
+            );
             this.close();
             return;
           }
-          this.sendError('主机密钥签名验证失败 - 可能会有安全风险，但不阻断连接（严格模式已关闭）', 'host_key_signature_risk');
+          this.sendError(
+            '主机密钥签名验证失败 - 可能会有安全风险，但不阻断连接（严格模式已关闭）',
+            'host_key_signature_risk'
+          );
         }
       }
     } catch (e) {
       const errMsg = e instanceof Error ? e.message : String(e);
       this.sendDebug(`Signature verification error: ${errMsg}`);
       if (this.strictHostKeyVerify) {
-        this.sendError('主机密钥签名验证异常: ' + errMsg, 'host_key_signature_error', { message: errMsg });
+        this.sendError(`主机密钥签名验证异常: ${errMsg}`, 'host_key_signature_error', {
+          message: errMsg,
+        });
         this.close();
         return;
       }
@@ -884,33 +1015,42 @@ export class SSHSession {
       const mayReplaceHostKey = this.config.sessionPolicy?.allowHostKeyMutation !== false;
       if (signatureVerified && mayReplaceHostKey) {
         try {
-          this.ws.send(JSON.stringify({
-            type: 'host_key_changed',
-            ...commonMessage,
-            expectedFingerprint,
-          }));
-        } catch { /* WebSocket 已关闭 */ }
+          this.ws.send(
+            JSON.stringify({
+              type: 'host_key_changed',
+              ...commonMessage,
+              expectedFingerprint,
+            })
+          );
+        } catch {
+          /* WebSocket 已关闭 */
+        }
       }
       this.sendError('主机密钥指纹变更！请确认是否为预期行为。', 'host_key_changed');
       this.sendError(`已知指纹: ${expectedFingerprint}`, 'host_key_known', {
         fingerprint: expectedFingerprint,
       });
-      this.sendError(`实际指纹: ${this.hostKeyFingerprint} (${this.hostKeyType})`, 'host_key_actual', {
-        fingerprint: this.hostKeyFingerprint,
-        keyType: this.hostKeyType,
-      });
       this.sendError(
-        signatureVerified && mayReplaceHostKey
-          ? '连接已阻断。请在确认对话框中核对并决定是否信任新指纹。'
-          : signatureVerified
-            ? '连接已阻断。分享会话不允许替换所有者已信任的主机指纹。'
-            : '连接已阻断，且主机密钥签名未通过验证，无法信任新指纹。',
-        signatureVerified && mayReplaceHostKey
-          ? 'host_key_trust_instruction'
-          : signatureVerified
-            ? 'host_key_share_change_blocked'
-            : 'host_key_unverified_instruction',
+        `实际指纹: ${this.hostKeyFingerprint} (${this.hostKeyType})`,
+        'host_key_actual',
+        {
+          fingerprint: this.hostKeyFingerprint,
+          keyType: this.hostKeyType,
+        }
       );
+      let trustInstruction: string;
+      let trustEvent: string;
+      if (signatureVerified && mayReplaceHostKey) {
+        trustInstruction = '连接已阻断。请在确认对话框中核对并决定是否信任新指纹。';
+        trustEvent = 'host_key_trust_instruction';
+      } else if (signatureVerified) {
+        trustInstruction = '连接已阻断。分享会话不允许替换所有者已信任的主机指纹。';
+        trustEvent = 'host_key_share_change_blocked';
+      } else {
+        trustInstruction = '连接已阻断，且主机密钥签名未通过验证，无法信任新指纹。';
+        trustEvent = 'host_key_unverified_instruction';
+      }
+      this.sendError(trustInstruction, trustEvent);
       this.close(true);
       return false;
     }
@@ -922,7 +1062,7 @@ export class SSHSession {
         this.sendStatus(
           `已知主机指纹匹配 (${this.hostKeyType})，但签名未验证`,
           'host_key_fingerprint_matched_unverified',
-          { keyType: this.hostKeyType },
+          { keyType: this.hostKeyType }
         );
       }
       return true;
@@ -932,22 +1072,26 @@ export class SSHSession {
       this.sendStatus(
         `服务器指纹: ${this.hostKeyFingerprint} (${this.hostKeyType})（签名未验证，未记录）`,
         'host_key_not_saved',
-        { fingerprint: this.hostKeyFingerprint, keyType: this.hostKeyType },
+        { fingerprint: this.hostKeyFingerprint, keyType: this.hostKeyType }
       );
       return true;
     }
 
     try {
-      this.ws.send(JSON.stringify({
-        type: 'host_key_verified',
-        ...commonMessage,
-        firstSeen: true,
-      }));
-    } catch { /* WebSocket 已关闭 */ }
+      this.ws.send(
+        JSON.stringify({
+          type: 'host_key_verified',
+          ...commonMessage,
+          firstSeen: true,
+        })
+      );
+    } catch {
+      /* WebSocket 已关闭 */
+    }
     this.sendStatus(
       `服务器指纹: ${this.hostKeyFingerprint} (${this.hostKeyType})（首次连接，验证通过）`,
       'host_key_first_seen',
-      { fingerprint: this.hostKeyFingerprint, keyType: this.hostKeyType },
+      { fingerprint: this.hostKeyFingerprint, keyType: this.hostKeyType }
     );
     return true;
   }
@@ -959,8 +1103,11 @@ export class SSHSession {
   ): Promise<boolean | null> {
     // Parse host key blob to get key type and raw key
     let offset = 0;
-    const keyTypeLen = (hostKeyBlob[offset] << 24) | (hostKeyBlob[offset+1] << 16) |
-                       (hostKeyBlob[offset+2] << 8) | hostKeyBlob[offset+3];
+    const keyTypeLen =
+      (hostKeyBlob[offset] << 24) |
+      (hostKeyBlob[offset + 1] << 16) |
+      (hostKeyBlob[offset + 2] << 8) |
+      hostKeyBlob[offset + 3];
     offset += 4;
     const keyType = this.textDecoder.decode(hostKeyBlob.subarray(offset, offset + keyTypeLen));
     offset += keyTypeLen;
@@ -968,62 +1115,81 @@ export class SSHSession {
 
     // Parse signature blob to get sig type and raw sig
     let sigOffset = 0;
-    const sigTypeLen = (signatureBlob[sigOffset] << 24) | (signatureBlob[sigOffset+1] << 16) |
-                       (signatureBlob[sigOffset+2] << 8) | signatureBlob[sigOffset+3];
+    const sigTypeLen =
+      (signatureBlob[sigOffset] << 24) |
+      (signatureBlob[sigOffset + 1] << 16) |
+      (signatureBlob[sigOffset + 2] << 8) |
+      signatureBlob[sigOffset + 3];
     sigOffset += 4;
-    const sigType = this.textDecoder.decode(signatureBlob.subarray(sigOffset, sigOffset + sigTypeLen));
+    const sigType = this.textDecoder.decode(
+      signatureBlob.subarray(sigOffset, sigOffset + sigTypeLen)
+    );
     sigOffset += sigTypeLen;
-    const rawSigLen = (signatureBlob[sigOffset] << 24) | (signatureBlob[sigOffset+1] << 16) |
-                      (signatureBlob[sigOffset+2] << 8) | signatureBlob[sigOffset+3];
+    const rawSigLen =
+      (signatureBlob[sigOffset] << 24) |
+      (signatureBlob[sigOffset + 1] << 16) |
+      (signatureBlob[sigOffset + 2] << 8) |
+      signatureBlob[sigOffset + 3];
     sigOffset += 4;
     const rawSig = signatureBlob.subarray(sigOffset, sigOffset + rawSigLen);
     this.sendDebug(`Signature type: ${sigType}, raw sig len: ${rawSig.length}`);
 
     if (keyType === 'ssh-ed25519') {
-      const rawKeyLen = (hostKeyBlob[offset] << 24) | (hostKeyBlob[offset+1] << 16) |
-                        (hostKeyBlob[offset+2] << 8) | hostKeyBlob[offset+3];
+      const rawKeyLen =
+        (hostKeyBlob[offset] << 24) |
+        (hostKeyBlob[offset + 1] << 16) |
+        (hostKeyBlob[offset + 2] << 8) |
+        hostKeyBlob[offset + 3];
       offset += 4;
       const rawKey = hostKeyBlob.subarray(offset, offset + rawKeyLen);
       this.sendDebug(`Ed25519 public key: ${rawKey.length} bytes`);
 
-      const pubKey = await crypto.subtle.importKey(
-        'raw',
-        rawKey,
-        { name: 'Ed25519' },
-        false,
-        ['verify']
-      );
+      const pubKey = await crypto.subtle.importKey('raw', rawKey, { name: 'Ed25519' }, false, [
+        'verify',
+      ]);
 
-      return await crypto.subtle.verify(
-        'Ed25519',
-        pubKey,
-        rawSig,
-        exchangeHash
-      );
-    } else if (keyType === 'ecdsa-sha2-nistp256' ||
-               keyType === 'ecdsa-sha2-nistp384' ||
-               keyType === 'ecdsa-sha2-nistp521') {
+      return await crypto.subtle.verify('Ed25519', pubKey, rawSig, exchangeHash);
+    } else if (
+      keyType === 'ecdsa-sha2-nistp256' ||
+      keyType === 'ecdsa-sha2-nistp384' ||
+      keyType === 'ecdsa-sha2-nistp521'
+    ) {
       // RFC 5656: ECDSA 主机密钥按曲线 exhaustive 支持
       let namedCurve: string;
       let hash: 'SHA-256' | 'SHA-384' | 'SHA-512';
       let coordBytes: number;
       switch (keyType) {
         case 'ecdsa-sha2-nistp256':
-          namedCurve = 'P-256'; hash = 'SHA-256'; coordBytes = 32; break;
+          namedCurve = 'P-256';
+          hash = 'SHA-256';
+          coordBytes = 32;
+          break;
         case 'ecdsa-sha2-nistp384':
-          namedCurve = 'P-384'; hash = 'SHA-384'; coordBytes = 48; break;
+          namedCurve = 'P-384';
+          hash = 'SHA-384';
+          coordBytes = 48;
+          break;
         case 'ecdsa-sha2-nistp521':
-          namedCurve = 'P-521'; hash = 'SHA-512'; coordBytes = 66; break;
+          namedCurve = 'P-521';
+          hash = 'SHA-512';
+          coordBytes = 66;
+          break;
         default:
           throw new Error(`unsupported ECDSA host key: ${keyType}`);
       }
 
       // Parse ECDSA key blob: string(curve), string(point)
-      const curveLen = (hostKeyBlob[offset] << 24) | (hostKeyBlob[offset+1] << 16) |
-                       (hostKeyBlob[offset+2] << 8) | hostKeyBlob[offset+3];
+      const curveLen =
+        (hostKeyBlob[offset] << 24) |
+        (hostKeyBlob[offset + 1] << 16) |
+        (hostKeyBlob[offset + 2] << 8) |
+        hostKeyBlob[offset + 3];
       offset += 4 + curveLen;
-      const rawKeyLen = (hostKeyBlob[offset] << 24) | (hostKeyBlob[offset+1] << 16) |
-                        (hostKeyBlob[offset+2] << 8) | hostKeyBlob[offset+3];
+      const rawKeyLen =
+        (hostKeyBlob[offset] << 24) |
+        (hostKeyBlob[offset + 1] << 16) |
+        (hostKeyBlob[offset + 2] << 8) |
+        hostKeyBlob[offset + 3];
       offset += 4;
       const rawKey = hostKeyBlob.subarray(offset, offset + rawKeyLen);
       this.sendDebug(`ECDSA public key: ${rawKey.length} bytes, curve=${namedCurve}`);
@@ -1040,25 +1206,26 @@ export class SSHSession {
       const ecdsaRawSig = this.convertSSHECDSASig(rawSig, coordBytes);
       this.sendDebug(`ECDSA raw sig: ${ecdsaRawSig.length} bytes`);
 
-      return await crypto.subtle.verify(
-        { name: 'ECDSA', hash },
-        pubKey,
-        ecdsaRawSig,
-        exchangeHash
-      );
+      return await crypto.subtle.verify({ name: 'ECDSA', hash }, pubKey, ecdsaRawSig, exchangeHash);
     } else if (keyType === 'ssh-rsa') {
       // Parse RSA key
-      const eLen = (hostKeyBlob[offset] << 24) | (hostKeyBlob[offset+1] << 16) |
-                   (hostKeyBlob[offset+2] << 8) | hostKeyBlob[offset+3];
+      const eLen =
+        (hostKeyBlob[offset] << 24) |
+        (hostKeyBlob[offset + 1] << 16) |
+        (hostKeyBlob[offset + 2] << 8) |
+        hostKeyBlob[offset + 3];
       offset += 4;
       const eRaw = hostKeyBlob.subarray(offset, offset + eLen);
       offset += eLen;
-      
-      const nLen = (hostKeyBlob[offset] << 24) | (hostKeyBlob[offset+1] << 16) |
-                   (hostKeyBlob[offset+2] << 8) | hostKeyBlob[offset+3];
+
+      const nLen =
+        (hostKeyBlob[offset] << 24) |
+        (hostKeyBlob[offset + 1] << 16) |
+        (hostKeyBlob[offset + 2] << 8) |
+        hostKeyBlob[offset + 3];
       offset += 4;
       const nRaw = hostKeyBlob.subarray(offset, offset + nLen);
-      
+
       // Determine hash algorithm based on signature type (RFC 8332)
       let hashAlgo: 'SHA-256' | 'SHA-512' | 'SHA-1';
       if (sigType === 'rsa-sha2-256') hashAlgo = 'SHA-256';
@@ -1068,15 +1235,17 @@ export class SSHSession {
         this.sendDebug(`Unknown RSA signature type: ${sigType}`);
         return false;
       }
-      
-      this.sendDebug(`RSA public key: n=${nRaw.length} bytes, e=${eRaw.length} bytes, sigType=${sigType}, hash=${hashAlgo}`);
+
+      this.sendDebug(
+        `RSA public key: n=${nRaw.length} bytes, e=${eRaw.length} bytes, sigType=${sigType}, hash=${hashAlgo}`
+      );
 
       // Convert to JWK format for import
       const jwk = {
-        kty: "RSA",
+        kty: 'RSA',
         e: this.base64UrlEncodeUnsigned(eRaw),
         n: this.base64UrlEncodeUnsigned(nRaw),
-        ext: true
+        ext: true,
       };
 
       try {
@@ -1088,15 +1257,10 @@ export class SSHSession {
           ['verify']
         );
 
-        return await crypto.subtle.verify(
-          'RSASSA-PKCS1-v1_5',
-          pubKey,
-          rawSig,
-          exchangeHash
-        );
+        return await crypto.subtle.verify('RSASSA-PKCS1-v1_5', pubKey, rawSig, exchangeHash);
       } catch (e) {
-         this.sendDebug(`RSA import/verify error: ${e}`);
-         return false;
+        this.sendDebug(`RSA import/verify error: ${e}`);
+        return false;
       }
     }
 
@@ -1120,13 +1284,19 @@ export class SSHSession {
   private convertSSHECDSASig(sshSig: Uint8Array, coordBytes: number = 32): Uint8Array {
     // SSH ECDSA sig is: string r, string s (each mpint)
     let offset = 0;
-    const rLen = (sshSig[offset] << 24) | (sshSig[offset+1] << 16) |
-                 (sshSig[offset+2] << 8) | sshSig[offset+3];
+    const rLen =
+      (sshSig[offset] << 24) |
+      (sshSig[offset + 1] << 16) |
+      (sshSig[offset + 2] << 8) |
+      sshSig[offset + 3];
     offset += 4;
     let r = sshSig.subarray(offset, offset + rLen);
     offset += rLen;
-    const sLen = (sshSig[offset] << 24) | (sshSig[offset+1] << 16) |
-                 (sshSig[offset+2] << 8) | sshSig[offset+3];
+    const sLen =
+      (sshSig[offset] << 24) |
+      (sshSig[offset + 1] << 16) |
+      (sshSig[offset + 2] << 8) |
+      sshSig[offset + 3];
     offset += 4;
     let s = sshSig.subarray(offset, offset + sLen);
 
@@ -1155,9 +1325,10 @@ export class SSHSession {
       this.encryptMac = null;
     } else {
       this.encryptCipher = new SSHAESCTRCipher(encKeyC2S, keys.ivClientToServer);
-      this.encryptMac = this.negotiatedMacC2S === 'none'
-        ? null
-        : new SSHHMAC(this.negotiatedMacC2S, keys.integrityKeyC2S);
+      this.encryptMac =
+        this.negotiatedMacC2S === 'none'
+          ? null
+          : new SSHHMAC(this.negotiatedMacC2S, keys.integrityKeyC2S);
     }
     await this.encryptCipher.init();
     if (this.encryptMac) await this.encryptMac.init();
@@ -1167,9 +1338,10 @@ export class SSHSession {
       this.decryptMac = null;
     } else {
       this.decryptCipher = new SSHAESCTRCipher(encKeyS2C, keys.ivServerToClient);
-      this.decryptMac = this.negotiatedMacS2C === 'none'
-        ? null
-        : new SSHHMAC(this.negotiatedMacS2C, keys.integrityKeyS2C);
+      this.decryptMac =
+        this.negotiatedMacS2C === 'none'
+          ? null
+          : new SSHHMAC(this.negotiatedMacS2C, keys.integrityKeyS2C);
     }
     await this.decryptCipher.init();
     if (this.decryptMac) await this.decryptMac.init();
@@ -1204,8 +1376,10 @@ export class SSHSession {
       case 'none':
         return true;
       case 'publickey':
-        return this.config.authMethod === 'publickey'
-          && Boolean(this.config.privateKey && this.sessionID);
+        return (
+          this.config.authMethod === 'publickey' &&
+          Boolean(this.config.privateKey && this.sessionID)
+        );
       case 'password':
         return this.config.authMethod !== 'publickey' && Boolean(this.config.password);
       case 'keyboard-interactive':
@@ -1231,14 +1405,11 @@ export class SSHSession {
           this.config.privateKey!,
           this.sessionID!,
           this.serverSigAlgs,
-          false,
+          false
         );
         break;
       case 'password':
-        authRequest = SSHAuth.buildPasswordAuthRequest(
-          this.config.username,
-          this.config.password,
-        );
+        authRequest = SSHAuth.buildPasswordAuthRequest(this.config.username, this.config.password);
         break;
       case 'keyboard-interactive':
         this.clearPendingAuthChallenge();
@@ -1255,41 +1426,37 @@ export class SSHSession {
 
   private selectNextAuthMethod(
     allowedMethods: string[],
-    previousMethod: ActiveAuthMethod | null,
+    previousMethod: ActiveAuthMethod | null
   ): ActiveAuthMethod | null {
-    const configuredFirst: ActiveAuthMethod[] = this.config.authMethod === 'publickey'
-      ? ['publickey', 'keyboard-interactive']
-      : ['password', 'keyboard-interactive'];
+    const configuredFirst: ActiveAuthMethod[] =
+      this.config.authMethod === 'publickey'
+        ? ['publickey', 'keyboard-interactive']
+        : ['password', 'keyboard-interactive'];
     // RFC 4252 allows a server to omit the list in a failure response. Keep
     // compatibility with such servers after the harmless "none" probe by
     // falling back to the user's configured primary method.
-    const effectiveAllowedMethods = previousMethod === 'none' && allowedMethods.length === 0
-      ? configuredFirst
-      : allowedMethods;
-    const candidates = configuredFirst.filter((method) =>
-      effectiveAllowedMethods.includes(method)
-      && !this.attemptedAuthMethods.has(method)
-      && this.canUseAuthMethod(method)
+    const effectiveAllowedMethods =
+      previousMethod === 'none' && allowedMethods.length === 0 ? configuredFirst : allowedMethods;
+    const candidates = configuredFirst.filter(
+      (method) =>
+        effectiveAllowedMethods.includes(method) &&
+        !this.attemptedAuthMethods.has(method) &&
+        this.canUseAuthMethod(method)
     );
 
-    return candidates.find((method) => method !== previousMethod)
-      ?? candidates[0]
-      ?? null;
+    return candidates.find((method) => method !== previousMethod) ?? candidates[0] ?? null;
   }
 
-  private failAuthentication(
-    message?: string,
-    event?: string,
-    normalClose: boolean = false,
-  ): void {
+  private failAuthentication(message?: string, event?: string, normalClose: boolean = false): void {
     const wasInteractive = this.activeAuthMethod === 'keyboard-interactive';
     this.clearPendingAuthChallenge();
     this.activeAuthMethod = null;
     this.sendError(
-      message ?? (wasInteractive
-        ? '交互式认证失败：服务器拒绝了响应'
-        : '认证失败：用户名、凭据或交互式响应无效'),
-      event ?? (wasInteractive ? 'auth_interactive_failed' : 'auth_failed'),
+      message ??
+        (wasInteractive
+          ? '交互式认证失败：服务器拒绝了响应'
+          : '认证失败：用户名、凭据或交互式响应无效'),
+      event ?? (wasInteractive ? 'auth_interactive_failed' : 'auth_failed')
     );
     this.close(normalClose);
   }
@@ -1304,22 +1471,19 @@ export class SSHSession {
     if (this.activeAuthMethod !== 'keyboard-interactive') {
       this.failAuthentication(
         '服务器发送了当前认证方式不支持的交互消息',
-        'auth_interactive_protocol_error',
+        'auth_interactive_protocol_error'
       );
       return;
     }
     if (this.pendingAuthChallenge) {
       this.failAuthentication(
         '服务器在上一轮响应前发送了新的交互式认证请求',
-        'auth_interactive_protocol_error',
+        'auth_interactive_protocol_error'
       );
       return;
     }
     if (this.keyboardInteractiveRounds >= MAX_KEYBOARD_INTERACTIVE_ROUNDS) {
-      this.failAuthentication(
-        '交互式认证轮次过多，连接已终止',
-        'auth_interactive_limit',
-      );
+      this.failAuthentication('交互式认证轮次过多，连接已终止', 'auth_interactive_limit');
       return;
     }
 
@@ -1329,7 +1493,7 @@ export class SSHSession {
     } catch {
       this.failAuthentication(
         '服务器发送了无效的交互式认证请求',
-        'auth_interactive_protocol_error',
+        'auth_interactive_protocol_error'
       );
       return;
     }
@@ -1341,7 +1505,7 @@ export class SSHSession {
       this.pendingAuthChallenge = null;
       this.sendError(
         '浏览器未确认显示交互式认证请求，请刷新页面后重试',
-        'auth_interactive_client_unavailable',
+        'auth_interactive_client_unavailable'
       );
       // Authentication timeouts are expected application outcomes. A normal
       // close also prevents older frontends from reconnecting repeatedly and
@@ -1357,21 +1521,23 @@ export class SSHSession {
     };
 
     try {
-      this.ws.send(JSON.stringify({
-        type: 'auth_challenge',
-        id,
-        name: request.name,
-        instruction: request.instruction,
-        prompts: request.prompts,
-        host: this.config.host,
-        port: this.config.port,
-        canUseStoredPassword: Boolean(
-          this.config.password
-          && this.config.authMethod !== 'publickey'
-          && request.prompts.length === 1
-          && !request.prompts[0].echo
-        ),
-      }));
+      this.ws.send(
+        JSON.stringify({
+          type: 'auth_challenge',
+          id,
+          name: request.name,
+          instruction: request.instruction,
+          prompts: request.prompts,
+          host: this.config.host,
+          port: this.config.port,
+          canUseStoredPassword: Boolean(
+            this.config.password &&
+              this.config.authMethod !== 'publickey' &&
+              request.prompts.length === 1 &&
+              !request.prompts[0].echo
+          ),
+        })
+      );
     } catch {
       this.clearPendingAuthChallenge();
       this.close();
@@ -1412,28 +1578,28 @@ export class SSHSession {
     let responses: string[];
     if (message.useStoredPassword === true) {
       if (
-        !this.config.password
-        || this.config.authMethod === 'publickey'
-        || pending.prompts.length !== 1
-        || pending.prompts[0].echo
-        || Object.prototype.hasOwnProperty.call(message, 'responses')
+        !this.config.password ||
+        this.config.authMethod === 'publickey' ||
+        pending.prompts.length !== 1 ||
+        pending.prompts[0].echo ||
+        Object.hasOwn(message, 'responses')
       ) {
         this.failAuthentication(
           '当前交互式认证请求不能使用已保存密码',
-          'auth_interactive_invalid_response',
+          'auth_interactive_invalid_response'
         );
         return;
       }
       responses = [this.config.password];
     } else {
       if (
-        !Array.isArray(message.responses)
-        || message.responses.length !== pending.prompts.length
-        || !message.responses.every((response) => typeof response === 'string')
+        !Array.isArray(message.responses) ||
+        message.responses.length !== pending.prompts.length ||
+        !message.responses.every((response) => typeof response === 'string')
       ) {
         this.failAuthentication(
           '交互式认证响应数量或格式无效',
-          'auth_interactive_invalid_response',
+          'auth_interactive_invalid_response'
         );
         return;
       }
@@ -1444,10 +1610,7 @@ export class SSHSession {
     try {
       responsePayload = SSHAuth.buildKeyboardInteractiveInfoResponse(responses);
     } catch {
-      this.failAuthentication(
-        '交互式认证响应超过安全限制',
-        'auth_interactive_invalid_response',
-      );
+      this.failAuthentication('交互式认证响应超过安全限制', 'auth_interactive_invalid_response');
       return;
     }
 
@@ -1517,7 +1680,7 @@ export class SSHSession {
         if (this.pendingAuthChallenge) {
           this.failAuthentication(
             '服务器在等待交互式认证响应时提前结束了当前认证步骤',
-            'auth_interactive_protocol_error',
+            'auth_interactive_protocol_error'
           );
           break;
         }
@@ -1531,13 +1694,13 @@ export class SSHSession {
         } catch {
           this.failAuthentication(
             '服务器发送了无效的认证失败响应',
-            'auth_interactive_protocol_error',
+            'auth_interactive_protocol_error'
           );
           break;
         }
 
         this.sendDebug(
-          `Authentication failure: allowed=[${allowedMethods.join(',')}], partial=${partialSuccess}`,
+          `Authentication failure: allowed=[${allowedMethods.join(',')}], partial=${partialSuccess}`
         );
         const previousMethod = this.activeAuthMethod;
         const configuredPrimaryMethod: ActiveAuthMethod =
@@ -1545,10 +1708,7 @@ export class SSHSession {
         if (partialSuccess) {
           this.partialAuthenticationStages++;
           if (this.partialAuthenticationStages > MAX_PARTIAL_AUTHENTICATION_STAGES) {
-            this.failAuthentication(
-              '多因素认证步骤过多，连接已终止',
-              'auth_interactive_limit',
-            );
+            this.failAuthentication('多因素认证步骤过多，连接已终止', 'auth_interactive_limit');
             break;
           }
           // A partial success starts a new authentication factor. Methods that
@@ -1556,8 +1716,8 @@ export class SSHSession {
           // be attempted again (for example keyboard-interactive,publickey).
           this.attemptedAuthMethods.clear();
         } else if (
-          previousMethod === configuredPrimaryMethod
-          && allowedMethods.includes(configuredPrimaryMethod)
+          previousMethod === configuredPrimaryMethod &&
+          allowedMethods.includes(configuredPrimaryMethod)
         ) {
           // The configured credential was rejected and the server still
           // offers the same method. Do not reinterpret that rejection as an
@@ -1569,7 +1729,7 @@ export class SSHSession {
         }
 
         const nextMethod = this.selectNextAuthMethod(allowedMethods, previousMethod);
-        if (nextMethod && await this.authenticateWithMethod(nextMethod)) {
+        if (nextMethod && (await this.authenticateWithMethod(nextMethod))) {
           break;
         }
 
@@ -1587,20 +1747,14 @@ export class SSHSession {
           // password method (RFC 4252), not an RFC 4256 INFO_REQUEST.
           this.failAuthentication(
             '服务器要求更改已过期密码，当前版本暂不支持在认证期间修改密码',
-            'auth_password_change_required',
+            'auth_password_change_required'
           );
         } else if (this.activeAuthMethod === 'publickey') {
           // With publickey it is SSH_MSG_USERAUTH_PK_OK. CloudSSH always sends
           // the signature in its first request, so this response is unexpected.
-          this.failAuthentication(
-            '服务器返回了意外的公钥认证确认',
-            'auth_protocol_error',
-          );
+          this.failAuthentication('服务器返回了意外的公钥认证确认', 'auth_protocol_error');
         } else {
-          this.failAuthentication(
-            '服务器在认证方式探测阶段返回了意外消息',
-            'auth_protocol_error',
-          );
+          this.failAuthentication('服务器在认证方式探测阶段返回了意外消息', 'auth_protocol_error');
         }
         break;
 
@@ -1633,7 +1787,9 @@ export class SSHSession {
           return;
         }
         channel.handleOpenConfirmation(payload);
-        this.sendDebug(`CHANNEL_OPEN_CONFIRMATION: channelID=${channelID}, remoteChannelID=${channel.getRemoteChannelID()}, isSFTP=${this.sftpHandler && channelID === this.sftpHandler.getChannelID()}`);
+        this.sendDebug(
+          `CHANNEL_OPEN_CONFIRMATION: channelID=${channelID}, remoteChannelID=${channel.getRemoteChannelID()}, isSFTP=${this.sftpHandler && channelID === this.sftpHandler.getChannelID()}`
+        );
 
         const directPending = this.pendingDirectTcpip.get(channelID);
         if (directPending) {
@@ -1666,7 +1822,11 @@ export class SSHSession {
         const channelID = this.getChannelIDFromPayload(payload);
         const reasonCode = (payload[5] << 24) | (payload[6] << 16) | (payload[7] << 8) | payload[8];
         let offset = 9;
-        const descLen = (payload[offset] << 24) | (payload[offset+1] << 16) | (payload[offset+2] << 8) | payload[offset+3];
+        const descLen =
+          (payload[offset] << 24) |
+          (payload[offset + 1] << 16) |
+          (payload[offset + 2] << 8) |
+          payload[offset + 3];
         offset += 4;
         const description = this.textDecoder.decode(payload.subarray(offset, offset + descLen));
 
@@ -1677,15 +1837,19 @@ export class SSHSession {
         if (directPending || directStream) {
           if (directPending) {
             clearTimeout(directPending.timeout);
-            directPending.reject(new Error(`跳板服务器拒绝 TCP 转发：${description || `reason ${reasonCode}`}`));
+            directPending.reject(
+              new Error(`跳板服务器拒绝 TCP 转发：${description || `reason ${reasonCode}`}`)
+            );
             this.pendingDirectTcpip.delete(channelID);
           }
-          directStream?.remoteClose(new Error(description || `direct-tcpip rejected (${reasonCode})`));
+          directStream?.remoteClose(
+            new Error(description || `direct-tcpip rejected (${reasonCode})`)
+          );
           this.directTcpipStreams.delete(channelID);
         } else if (this.sftpHandler && channelID === this.sftpHandler.getChannelID()) {
           // SFTP channel open failed - notify frontend, don't close terminal
           this.sendDebug(`SFTP channel open failed: reason=${reasonCode}, desc=${description}`);
-          this.sendSFTPError('init', '服务器不支持 SFTP: ' + description);
+          this.sendSFTPError('init', `服务器不支持 SFTP: ${description}`);
           this.sftpHandler = null;
         } else if (this.isExecChannel(channelID)) {
           // Exec channel open failed - reject just this command, keep SSH session alive
@@ -1694,7 +1858,9 @@ export class SSHSession {
             execCh.onChannelOpenFailure(reasonCode, description);
             this.activeExecChannels.delete(channelID);
           }
-          this.sendDebug(`Exec channel open failed: channelID=${channelID}, reason=${reasonCode}, desc=${description}`);
+          this.sendDebug(
+            `Exec channel open failed: channelID=${channelID}, reason=${reasonCode}, desc=${description}`
+          );
         } else {
           // Shell channel failed - close connection
           this.sendError('通道打开被拒绝', 'channel_rejected');
@@ -1716,7 +1882,10 @@ export class SSHSession {
               await this.onShellReady();
             }
           }, 3000);
-        } else if (channelID === this.shellChannel.getLocalChannelID() && this.state === 'shell-requested') {
+        } else if (
+          channelID === this.shellChannel.getLocalChannelID() &&
+          this.state === 'shell-requested'
+        ) {
           // Shell request confirmed
           if (this.shellReadyTimeout) {
             clearTimeout(this.shellReadyTimeout);
@@ -1732,7 +1901,7 @@ export class SSHSession {
             const errMsg = error instanceof Error ? error.message : String(error);
             this.sendDebug(`SFTP onSubsystemReady ERROR: ${errMsg}`);
             if (this.sftpHandler === handler) {
-              this.sendSFTPError('init', 'SFTP 初始化失败: ' + errMsg);
+              this.sendSFTPError('init', `SFTP 初始化失败: ${errMsg}`);
             }
           });
         } else {
@@ -1782,15 +1951,32 @@ export class SSHSession {
             await this.onShellReady();
           }
           const outputData = channel.handleChannelData(payload);
-          try { this.ws.send(outputData); } catch (e) { this.sendDebug(() => `Send shell output failed: ${e instanceof Error ? e.message : e}`); }
-          this.recordShareTerminalOutput(outputData);
-          this.queueLocalWindowAdjust(outputData.length, channel);
+          if (this.detached) {
+            this.handleDetachedTerminalOutput(outputData, channel);
+          } else {
+            try {
+              this.ws.send(outputData);
+            } catch (e) {
+              this.sendDebug(
+                () => `Send shell output failed: ${e instanceof Error ? e.message : e}`
+              );
+            }
+            this.recordShareTerminalOutput(outputData);
+            this.queueLocalWindowAdjust(outputData.length, channel);
+          }
           // Feed terminal context for Agent
-          try { this.terminalContext.appendOutput(this.textDecoder.decode(outputData)); } catch {}
+          try {
+            this.terminalContext.appendOutput(this.textDecoder.decode(outputData));
+          } catch {
+            /* 解码/追加失败不影响主会话，静默忽略 */
+          }
         } else if (this.sftpHandler && channelID === this.sftpHandler.getChannelID()) {
           // SFTP channel data - forward to SFTP handler
           const sftpData = channel.handleChannelData(payload);
-          this.sendDebug(() => `SFTP CHANNEL_DATA received: channelID=${channelID}, dataLen=${sftpData.length}, firstByte=${sftpData[0]}`);
+          this.sendDebug(
+            () =>
+              `SFTP CHANNEL_DATA received: channelID=${channelID}, dataLen=${sftpData.length}, firstByte=${sftpData[0]}`
+          );
           this.sftpHandler.onChannelData(sftpData);
           this.queueLocalWindowAdjust(sftpData.length, channel);
         } else {
@@ -1798,8 +1984,12 @@ export class SSHSession {
           const execCh = this.activeExecChannels.get(channelID);
           if (execCh) {
             const execData = channel.handleChannelData(payload);
-            execCh.onData(execData);
-            this.queueLocalWindowAdjust(execData.length, channel);
+            if (execCh.onData(execData)) {
+              this.queueLocalWindowAdjust(execData.length, channel);
+            } else {
+              // 捕获达到硬上限：停止续 window 并关闭通道，sshd 会终止远端命令
+              await this.terminateExecChannelOnCaptureLimit(channelID, channel, execCh);
+            }
           }
         }
         break;
@@ -1813,25 +2003,45 @@ export class SSHSession {
         if (channel === this.shellChannel) {
           // stderr data from shell - forward to terminal
           let offset = 1 + 4; // skip msgType + recipient_channel
-          const dataTypeCode = (payload[offset] << 24) | (payload[offset+1] << 16) | (payload[offset+2] << 8) | payload[offset+3];
-          offset += 4;
-          const dataLen = (payload[offset] << 24) | (payload[offset+1] << 16) | (payload[offset+2] << 8) | payload[offset+3];
+          offset += 4; // skip dataTypeCode (4 bytes, unused)
+          const dataLen =
+            (payload[offset] << 24) |
+            (payload[offset + 1] << 16) |
+            (payload[offset + 2] << 8) |
+            payload[offset + 3];
           offset += 4;
           const stderrData = payload.subarray(offset, offset + dataLen);
-          try { this.ws.send(stderrData); } catch (e) { this.sendDebug(() => `Send stderr output failed: ${e instanceof Error ? e.message : e}`); }
-          this.recordShareTerminalOutput(stderrData);
-          this.queueLocalWindowAdjust(stderrData.length, channel);
+          if (this.detached) {
+            this.handleDetachedTerminalOutput(stderrData, channel);
+          } else {
+            try {
+              this.ws.send(stderrData);
+            } catch (e) {
+              this.sendDebug(
+                () => `Send stderr output failed: ${e instanceof Error ? e.message : e}`
+              );
+            }
+            this.recordShareTerminalOutput(stderrData);
+            this.queueLocalWindowAdjust(stderrData.length, channel);
+          }
         } else {
           // Exec channel extended data (stderr for Agent)
           const execCh = this.activeExecChannels.get(channelID);
           if (execCh) {
             let offset = 1 + 4;
             offset += 4; // skip dataTypeCode
-            const dataLen = (payload[offset] << 24) | (payload[offset+1] << 16) | (payload[offset+2] << 8) | payload[offset+3];
+            const dataLen =
+              (payload[offset] << 24) |
+              (payload[offset + 1] << 16) |
+              (payload[offset + 2] << 8) |
+              payload[offset + 3];
             offset += 4;
             const stderrData = payload.subarray(offset, offset + dataLen);
-            execCh.onExtendedData(stderrData);
-            this.queueLocalWindowAdjust(stderrData.length, channel);
+            if (execCh.onExtendedData(stderrData)) {
+              this.queueLocalWindowAdjust(stderrData.length, channel);
+            } else {
+              await this.terminateExecChannelOnCaptureLimit(channelID, channel, execCh);
+            }
           }
         }
         break;
@@ -1929,7 +2139,11 @@ export class SSHSession {
         // Parse server-initiated CHANNEL_REQUEST (e.g., exit-status for exec channels)
         const reqChannelID = this.getChannelIDFromPayload(payload);
         let offset = 5; // skip msgType + channelID
-        const reqTypeLen = (payload[offset] << 24) | (payload[offset+1] << 16) | (payload[offset+2] << 8) | payload[offset+3];
+        const reqTypeLen =
+          (payload[offset] << 24) |
+          (payload[offset + 1] << 16) |
+          (payload[offset + 2] << 8) |
+          payload[offset + 3];
         offset += 4;
         const reqType = this.textDecoder.decode(payload.subarray(offset, offset + reqTypeLen));
         offset += reqTypeLen;
@@ -1938,9 +2152,15 @@ export class SSHSession {
         if (reqType === 'exit-status') {
           const execCh = this.activeExecChannels.get(reqChannelID);
           if (execCh) {
-            const exitCode = (payload[offset] << 24) | (payload[offset+1] << 16) | (payload[offset+2] << 8) | payload[offset+3];
+            const exitCode =
+              (payload[offset] << 24) |
+              (payload[offset + 1] << 16) |
+              (payload[offset + 2] << 8) |
+              payload[offset + 3];
             execCh.onExitStatus(exitCode);
-            this.sendDebug(`Exec channel exit-status: channelID=${reqChannelID}, exitCode=${exitCode}`);
+            this.sendDebug(
+              `Exec channel exit-status: channelID=${reqChannelID}, exitCode=${exitCode}`
+            );
           }
         } else if (reqType === 'exit-signal') {
           const execCh = this.activeExecChannels.get(reqChannelID);
@@ -1968,12 +2188,14 @@ export class SSHSession {
 
   async handleWebSocketMessage(data: string | ArrayBuffer): Promise<void> {
     if (typeof data === 'string') {
-      let parsed: any = undefined;
+      let parsed: any;
       // 仅对可能为 JSON 的消息尝试解析（以 { 开头），避免终端输入产生噪音日志
       if (data.charCodeAt(0) === 123) {
         try {
           parsed = JSON.parse(data);
-        } catch (e) { this.sendDebug(() => `JSON parse failed: ${e instanceof Error ? e.message : e}`); }
+        } catch (e) {
+          this.sendDebug(() => `JSON parse failed: ${e instanceof Error ? e.message : e}`);
+        }
       }
 
       if (parsed && typeof parsed === 'object') {
@@ -1990,9 +2212,8 @@ export class SSHSession {
           return;
         }
         if (parsed.type === 'ping') {
-          const id = typeof parsed.id === 'string' && parsed.id.length <= 128
-            ? parsed.id
-            : undefined;
+          const id =
+            typeof parsed.id === 'string' && parsed.id.length <= 128 ? parsed.id : undefined;
           this.ws.send(JSON.stringify({ type: 'pong', ...(id ? { id } : {}) }));
           return;
         }
@@ -2056,7 +2277,9 @@ export class SSHSession {
         return;
       }
 
-      this.enqueueSFTPTask(this.getSFTPOperation(parsed.type), () => this.handleSFTPMessage(parsed));
+      this.enqueueSFTPTask(this.getSFTPOperation(parsed.type), () =>
+        this.handleSFTPMessage(parsed)
+      );
       return;
     }
 
@@ -2104,6 +2327,9 @@ export class SSHSession {
         break;
       case 'sftp_download':
         await this.sftpHandler.downloadFile(msg.path);
+        break;
+      case 'sftp_edit_read':
+        await this.sftpHandler.editReadFile(msg.path);
         break;
       case 'sftp_download_cancel':
         this.sftpHandler.cancelDownload();
@@ -2169,7 +2395,9 @@ export class SSHSession {
 
     const openMsg = sftpChannel.buildOpenSession(channelID);
     await this.sendEncrypted(openMsg);
-    this.sendDebug(`SFTP channel open requested, channelID=${channelID}, channels count=${this.channels.size}`);
+    this.sendDebug(
+      `SFTP channel open requested, channelID=${channelID}, channels count=${this.channels.size}`
+    );
   }
 
   private enqueueSFTPTask(operation: string, task: () => Promise<void> | void): void {
@@ -2180,16 +2408,19 @@ export class SSHSession {
     this.sftpTaskQueue = run.catch((error) => {
       const errMsg = error instanceof Error ? error.message : String(error);
       this.sendDebug(`SFTP task ERROR: ${errMsg}`);
-      this.sendSFTPError(operation, 'SFTP 操作失败: ' + errMsg);
+      this.sendSFTPError(operation, `SFTP 操作失败: ${errMsg}`);
     });
   }
 
   private sendSFTPAttachUrl(): void {
     if (!this.sftpAttachUrl) return;
-    if (this.config.sessionPolicy?.source === 'share' && !this.config.sessionPolicy.allowSftp) return;
+    if (this.config.sessionPolicy?.source === 'share' && !this.config.sessionPolicy.allowSftp)
+      return;
     try {
       this.ws.send(JSON.stringify({ type: 'sftp_attach', url: this.sftpAttachUrl }));
-    } catch (e) { this.sendDebug(() => `Send sftp_attach url failed: ${e instanceof Error ? e.message : e}`); }
+    } catch (e) {
+      this.sendDebug(() => `Send sftp_attach url failed: ${e instanceof Error ? e.message : e}`);
+    }
   }
 
   private getSFTPOperation(type: string | undefined): string {
@@ -2203,6 +2434,8 @@ export class SSHSession {
       case 'sftp_download':
       case 'sftp_download_cancel':
         return 'download';
+      case 'sftp_edit_read':
+        return 'edit';
       case 'sftp_upload_start':
       case 'sftp_upload_end':
       case 'sftp_upload_cancel':
@@ -2223,7 +2456,7 @@ export class SSHSession {
   private async auditSFTPRequest(msg: Record<string, unknown>): Promise<boolean> {
     if (this.config.sessionPolicy?.source !== 'share') return true;
     const operation = this.getSFTPOperation(typeof msg.type === 'string' ? msg.type : undefined);
-    const auditable = new Set(['download', 'upload', 'delete', 'rename', 'mkdir', 'rmdir']);
+    const auditable = new Set(['download', 'edit', 'upload', 'delete', 'rename', 'mkdir', 'rmdir']);
     if (!auditable.has(operation)) return true;
     if (msg.type === 'sftp_upload_end') return true;
 
@@ -2231,7 +2464,8 @@ export class SSHSession {
     if (typeof msg.path === 'string') details.path = msg.path.slice(0, 4096);
     if (typeof msg.oldPath === 'string') details.oldPath = msg.oldPath.slice(0, 4096);
     if (typeof msg.newPath === 'string') details.newPath = msg.newPath.slice(0, 4096);
-    if (typeof msg.size === 'number' && Number.isFinite(msg.size)) details.size = Math.max(0, Math.floor(msg.size));
+    if (typeof msg.size === 'number' && Number.isFinite(msg.size))
+      details.size = Math.max(0, Math.floor(msg.size));
     if (msg.type === 'sftp_download_cancel' || msg.type === 'sftp_upload_cancel') {
       details.cancelled = true;
     } else {
@@ -2249,6 +2483,7 @@ export class SSHSession {
     if (this.config.sessionPolicy?.source !== 'share' || typeof msg.type !== 'string') return;
     const successTypes: Record<string, string> = {
       sftp_download_done: 'download',
+      sftp_edit_done: 'edit',
       sftp_upload_complete: 'upload',
       sftp_delete_result: 'delete',
       sftp_rename_result: 'rename',
@@ -2276,12 +2511,15 @@ export class SSHSession {
       success,
       ...(cancelled ? { cancelled: true } : {}),
     };
-    if (typeof msg.size === 'number' && Number.isFinite(msg.size)) details.transferredSize = Math.max(0, Math.floor(msg.size));
+    if (typeof msg.size === 'number' && Number.isFinite(msg.size))
+      details.transferredSize = Math.max(0, Math.floor(msg.size));
     if (!success && typeof msg.message === 'string') details.error = msg.message.slice(0, 512);
     this.sftpAuditContext.delete(operation);
-    this.runShareBackground(this.writeShareAudit('sftp.result', details).then((recorded) => {
-      if (!recorded) this.close(true);
-    }));
+    this.runShareBackground(
+      this.writeShareAudit('sftp.result', details).then((recorded) => {
+        if (!recorded) this.close(true);
+      })
+    );
   }
 
   private sendSFTPError(operation: string, message: string): void {
@@ -2322,7 +2560,9 @@ export class SSHSession {
     if (channel && !channel.isClosed()) {
       const eof = channel.buildEof();
       const close = channel.buildClose();
-      void this.sendEncrypted(eof).then(() => this.sendEncrypted(close)).catch(() => {});
+      void this.sendEncrypted(eof)
+        .then(() => this.sendEncrypted(close))
+        .catch(() => {});
     }
 
     this.channels.delete(channelID);
@@ -2333,6 +2573,15 @@ export class SSHSession {
   private enqueueChannelData(data: Uint8Array): void {
     if (data.length === 0) return;
 
+    // 浏览器→服务器输入积压上限：浏览器失去响应时 channelDataQueue 会无界堆积，
+    // 超限直接关闭会话（常规重连即可恢复，无需等待远端超时）。
+    if (this.channelDataQueueBytes + data.length > MAX_INPUT_QUEUE_BYTES) {
+      this.sendError('终端输入积压过多（客户端可能已无响应），连接已关闭', 'input_backlog_closed');
+      this.close();
+      return;
+    }
+
+    this.channelDataQueueBytes += data.length;
     this.channelDataQueue.push(data);
     void this.flushChannelDataQueue();
   }
@@ -2353,6 +2602,7 @@ export class SSHSession {
         if (this.channelDataQueueOffset >= current.length) {
           this.channelDataQueueHead++;
           this.channelDataQueueOffset = 0;
+          this.channelDataQueueBytes -= current.length;
         }
       }
 
@@ -2363,7 +2613,7 @@ export class SSHSession {
     } catch (error) {
       const errMsg = error instanceof Error ? error.message : String(error);
       this.sendDebug(`flushChannelDataQueue ERROR: ${errMsg}`);
-      this.sendError('发送数据失败: ' + errMsg, 'send_data_failed', { message: errMsg });
+      this.sendError(`发送数据失败: ${errMsg}`, 'send_data_failed', { message: errMsg });
       this.close();
     } finally {
       this.channelDataFlushInProgress = false;
@@ -2373,7 +2623,7 @@ export class SSHSession {
   private async sendDirectTcpipData(
     channelID: number,
     channel: SSHChannel,
-    data: Uint8Array,
+    data: Uint8Array
   ): Promise<void> {
     let offset = 0;
     while (offset < data.length) {
@@ -2413,7 +2663,10 @@ export class SSHSession {
     if (!this.updateTerminalSize(cols, rows)) return;
     if (this.state !== 'ready') return;
 
-    const resizeMsg = this.shellChannel.buildWindowChange(this.terminalSize.cols, this.terminalSize.rows);
+    const resizeMsg = this.shellChannel.buildWindowChange(
+      this.terminalSize.cols,
+      this.terminalSize.rows
+    );
     await this.sendEncrypted(resizeMsg);
   }
 
@@ -2429,7 +2682,10 @@ export class SSHSession {
     await this.sendEncryptedPacket(() => this.buildEncryptedPacket(payload));
   }
 
-  private async sendEncryptedChannelData(chunk: ChannelDataChunk, channel: SSHChannel): Promise<void> {
+  private async sendEncryptedChannelData(
+    chunk: ChannelDataChunk,
+    channel: SSHChannel
+  ): Promise<void> {
     await this.sendEncryptedPacket(() => this.buildEncryptedChannelDataPacket(chunk, channel));
   }
 
@@ -2439,7 +2695,10 @@ export class SSHSession {
       await this.writeSocket(encrypted);
     });
 
-    this.sendMutex = operation.then(() => {}, () => {});
+    this.sendMutex = operation.then(
+      () => {},
+      () => {}
+    );
     await operation;
   }
 
@@ -2458,23 +2717,31 @@ export class SSHSession {
     } catch (error) {
       const errMsg = error instanceof Error ? error.message : String(error);
       this.sendDebug(`sendLocalWindowAdjust ERROR: ${errMsg}`);
-      this.sendError('发送窗口调整失败: ' + errMsg, 'resize_failed', { message: errMsg });
+      this.sendError(`发送窗口调整失败: ${errMsg}`, 'resize_failed', { message: errMsg });
       this.close();
     }
   }
 
-  private sendStatus(message: string, event?: string, params?: Record<string, string | number>): void {
+  private sendStatus(
+    message: string,
+    event?: string,
+    params?: Record<string, string | number>
+  ): void {
     try {
       this.ws.send(JSON.stringify({ type: 'status', message, event, params }));
-    } catch (e) {
+    } catch {
       // WebSocket 已关闭，状态消息无法送达
     }
   }
 
-  private sendError(message: string, event?: string, params?: Record<string, string | number>): void {
+  private sendError(
+    message: string,
+    event?: string,
+    params?: Record<string, string | number>
+  ): void {
     try {
       this.ws.send(JSON.stringify({ type: 'error', message, event, params }));
-    } catch (e) {
+    } catch {
       // WebSocket 已关闭，错误消息无法送达
     }
   }
@@ -2482,8 +2749,13 @@ export class SSHSession {
   private sendDebug(message: string | (() => string)): void {
     if (!this.debugMode) return;
     try {
-      this.ws.send(JSON.stringify({ type: 'debug', message: typeof message === 'function' ? message() : message }));
-    } catch (e) {
+      this.ws.send(
+        JSON.stringify({
+          type: 'debug',
+          message: typeof message === 'function' ? message() : message,
+        })
+      );
+    } catch {
       // WebSocket 已关闭，调试消息无法送达
     }
   }
@@ -2496,11 +2768,13 @@ export class SSHSession {
     const operation = this.shareAuditWrite.then(async () => {
       try {
         const stub = this.env!.SSH_SHARE.get(this.env!.SSH_SHARE.idFromName(policy.shareRef));
-        const response = await stub.fetch(new Request('http://internal/internal/audit/event', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ eventType, occurredAt: Date.now(), details }),
-        }));
+        const response = await stub.fetch(
+          new Request('http://internal/internal/audit/event', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ eventType, occurredAt: Date.now(), details }),
+          })
+        );
         return response.ok;
       } catch {
         return false;
@@ -2511,7 +2785,12 @@ export class SSHSession {
   }
 
   private recordShareTerminalOutput(data: Uint8Array): void {
-    if (!this.shareAuditStarted || this.config.sessionPolicy?.source !== 'share' || data.length === 0) return;
+    if (
+      !this.shareAuditStarted ||
+      this.config.sessionPolicy?.source !== 'share' ||
+      data.length === 0
+    )
+      return;
     this.shareAuditBuffer += this.auditTextDecoder.decode(data, { stream: true });
     if (this.shareAuditBuffer.length >= SHARE_AUDIT_FLUSH_CHARS) {
       this.runShareBackground(this.flushShareAuditOutput());
@@ -2539,7 +2818,10 @@ export class SSHSession {
       const recorded = await this.writeShareAudit('terminal.output', { text: chunk });
       if (!recorded) {
         if (!this.closed) {
-          this.sendError('分享会话审计写入失败或已达到容量上限，连接已终止', 'share_audit_unavailable');
+          this.sendError(
+            '分享会话审计写入失败或已达到容量上限，连接已终止',
+            'share_audit_unavailable'
+          );
           this.close(true);
         }
         return false;
@@ -2552,16 +2834,22 @@ export class SSHSession {
     const policy = this.config.sessionPolicy;
     if (policy?.source !== 'share' || !this.env?.SSH_SHARE || this.shareAuditClosed) return;
     this.shareAuditClosed = true;
-    this.runShareBackground(this.flushShareAuditOutput().finally(async () => {
-      try {
-        const stub = this.env!.SSH_SHARE.get(this.env!.SSH_SHARE.idFromName(policy.shareRef));
-        await stub.fetch(new Request('http://internal/internal/session/closed', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ normal }),
-        }));
-      } catch {}
-    }));
+    this.runShareBackground(
+      this.flushShareAuditOutput().finally(async () => {
+        try {
+          const stub = this.env!.SSH_SHARE.get(this.env!.SSH_SHARE.idFromName(policy.shareRef));
+          await stub.fetch(
+            new Request('http://internal/internal/session/closed', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ normal }),
+            })
+          );
+        } catch {
+          /* 审计关闭通知失败不影响清理流程 */
+        }
+      })
+    );
   }
 
   private runShareBackground(promise: Promise<unknown>): void {
@@ -2592,20 +2880,37 @@ export class SSHSession {
         this.close(true);
         return;
       }
+      // 到期前 60s 预警：挂机用户往往无感知，提前明示会话即将结束
+      const expiryWarningLeadMs = 60_000;
+      const emitExpiryWarning = () => {
+        this.sendStatus('分享会话即将结束（剩余不足 1 分钟）', 'share_expiring_warning');
+      };
+      if (remaining > expiryWarningLeadMs) {
+        this.shareExpiryWarningTimer = setTimeout(
+          emitExpiryWarning,
+          remaining - expiryWarningLeadMs
+        );
+      } else {
+        emitExpiryWarning();
+      }
       this.shareSessionExpiryTimer = setTimeout(() => {
         this.sendError('分享会话已达到最长使用时间', 'share_session_expired');
         this.close(true);
       }, remaining);
       try {
-        this.ws.send(JSON.stringify({
-          type: 'session_capabilities',
-          source: 'share',
-          agent: false,
-          sftp: this.config.sessionPolicy.allowSftp,
-          audited: true,
-          expiresAt: this.config.sessionPolicy.sessionExpiresAt,
-        }));
-      } catch {}
+        this.ws.send(
+          JSON.stringify({
+            type: 'session_capabilities',
+            source: 'share',
+            agent: false,
+            sftp: this.config.sessionPolicy.allowSftp,
+            audited: true,
+            expiresAt: this.config.sessionPolicy.sessionExpiresAt,
+          })
+        );
+      } catch {
+        /* WebSocket 已关闭，忽略能力通告 */
+      }
     }
     this.sendStatus('Shell 已就绪', 'shell_ready');
     if (this.config.sessionPolicy?.allowMetadataMutation !== false) {
@@ -2620,7 +2925,13 @@ export class SSHSession {
   private async detectRemoteOS(): Promise<void> {
     if (this.config.sessionPolicy?.source === 'share') return;
     // 已保存服务器（token 路径才有 serverId）、未检测过、且未在进行中
-    if (!this.config.serverId || !this.userId || !this.githubId || this.config.os || this.osDetectInProgress) {
+    if (
+      !this.config.serverId ||
+      !this.userId ||
+      !this.githubId ||
+      this.config.os ||
+      this.osDetectInProgress
+    ) {
       return;
     }
     this.osDetectInProgress = true;
@@ -2658,7 +2969,9 @@ export class SSHSession {
         if (this.ws.readyState === WebSocket.OPEN) {
           this.ws.send(JSON.stringify({ type: 'os_detected', serverId: this.config.serverId, os }));
         }
-      } catch (e) { /* ws closed */ }
+      } catch {
+        /* ws closed */
+      }
     } catch (e) {
       this.sendDebug(`OS detect error: ${e instanceof Error ? e.message : String(e)}`);
     } finally {
@@ -2668,9 +2981,17 @@ export class SSHSession {
 
   // ==================== Agent Integration ====================
 
-  private async handleAgentStart(userMessage: string, userId?: string, requestedLocale?: string): Promise<void> {
+  private async handleAgentStart(
+    userMessage: string,
+    userId?: string,
+    requestedLocale?: string
+  ): Promise<void> {
     if (this.config.sessionPolicy?.source === 'share') {
-      this.sendAgentFrame({ type: 'agent_frame', subType: 'error', message: '分享会话不允许使用 AI Agent' });
+      this.sendAgentFrame({
+        type: 'agent_frame',
+        subType: 'error',
+        message: '分享会话不允许使用 AI Agent',
+      });
       return;
     }
     if (this.state !== 'ready') {
@@ -2681,18 +3002,30 @@ export class SSHSession {
     // Securely verify userId. Always use the authenticated session userId (this.userId).
     // Reject requests if client provides a conflicting userId.
     if (userId && this.userId && userId !== this.userId) {
-      this.sendAgentFrame({ type: 'agent_frame', subType: 'error', message: '用户身份不匹配，越权操作已被拦截' });
+      this.sendAgentFrame({
+        type: 'agent_frame',
+        subType: 'error',
+        message: '用户身份不匹配，越权操作已被拦截',
+      });
       return;
     }
 
     const effectiveUserId = this.userId;
     if (!effectiveUserId) {
-      this.sendAgentFrame({ type: 'agent_frame', subType: 'error', message: '需要登录用户才能使用 AI 助手' });
+      this.sendAgentFrame({
+        type: 'agent_frame',
+        subType: 'error',
+        message: '需要登录用户才能使用 AI 助手',
+      });
       return;
     }
 
     if (this.agentCore?.getStatus() === 'running') {
-      this.sendAgentFrame({ type: 'agent_frame', subType: 'error', message: 'Agent 正在运行中，请先停止当前任务' });
+      this.sendAgentFrame({
+        type: 'agent_frame',
+        subType: 'error',
+        message: 'Agent 正在运行中，请先停止当前任务',
+      });
       return;
     }
 
@@ -2701,8 +3034,9 @@ export class SSHSession {
         this.terminalContext,
         (msg: any) => this.sendAgentFrame(msg),
         async (uid: string) => this.fetchAgentAIConfig(uid, this.githubId!),
-        async (command: string, timeout: number, signal?: AbortSignal) => this.executeAgentCommand(command, timeout, signal),
-        async (command: string, reason: string) => this.askAgentConfirmation(command, reason),
+        async (command: string, timeout: number, signal?: AbortSignal) =>
+          this.executeAgentCommand(command, timeout, signal),
+        async (command: string, reason: string) => this.askAgentConfirmation(command, reason)
       );
     }
 
@@ -2728,7 +3062,10 @@ export class SSHSession {
     }
   }
 
-  private async fetchAgentAIConfig(userId: string, githubId: string): Promise<{ base_url: string; model: string; api_key: string } | null> {
+  private async fetchAgentAIConfig(
+    userId: string,
+    githubId: string
+  ): Promise<{ base_url: string; model: string; api_key: string } | null> {
     if (!this.env) return null;
     try {
       const stub = this.env.USER_DB.get(this.env.USER_DB.idFromName(githubId));
@@ -2736,16 +3073,39 @@ export class SSHSession {
         new Request(`http://internal/internal/ai-config/decrypt?user_id=${userId}`)
       );
       if (!res.ok) return null;
-      return await res.json() as { base_url: string; model: string; api_key: string };
+      return (await res.json()) as { base_url: string; model: string; api_key: string };
     } catch {
       return null;
+    }
+  }
+
+  /**
+   * exec 输出超过捕获硬上限：删除本地通道引用（不再接收数据、不再续窗口），
+   * 主动发送 CHANNEL_CLOSE —— sshd 会终止对应的远端命令（如无界输出的
+   * docker logs），并提前决议 closedPromise，让 Agent 拿到带截断标记的结果。
+   */
+  private async terminateExecChannelOnCaptureLimit(
+    channelID: number,
+    channel: SSHChannel,
+    execCh: AgentExecChannel
+  ): Promise<void> {
+    this.sendDebug(`Exec channel ${channelID} capture limit exceeded — closing channel`);
+    this.activeExecChannels.delete(channelID);
+    this.channels.delete(channelID);
+    execCh.onClose();
+    try {
+      if (!channel.isClosed()) {
+        await this.sendEncrypted(channel.buildClose());
+      }
+    } catch {
+      // 弱网下发送失败也无妨：本地状态已清理，远端因窗口耗尽自行停止推送
     }
   }
 
   private async executeAgentCommand(
     command: string,
     timeout: number,
-    signal?: AbortSignal,
+    signal?: AbortSignal
   ): Promise<{ stdout: string; stderr: string; exitCode: number }> {
     const channelID = this.nextChannelID++;
     const channel = new SSHChannel();
@@ -2776,12 +3136,19 @@ export class SSHSession {
       const result = await Promise.race([
         execCh.getClosedPromise(),
         new Promise<{ stdout: string; stderr: string; exitCode: number }>((_, reject) => {
-          const timer = setTimeout(() => reject(new Error(`Exec timeout after ${timeout}ms`)), timeout);
-          signal?.addEventListener('abort', () => {
-            aborted = true;
-            clearTimeout(timer);
-            reject(new Error('Exec aborted'));
-          }, { once: true });
+          const timer = setTimeout(
+            () => reject(new Error(`Exec timeout after ${timeout}ms`)),
+            timeout
+          );
+          signal?.addEventListener(
+            'abort',
+            () => {
+              aborted = true;
+              clearTimeout(timer);
+              reject(new Error('Exec aborted'));
+            },
+            { once: true }
+          );
         }),
       ]);
 
@@ -2810,7 +3177,11 @@ export class SSHSession {
     }
   }
 
-  private waitForExecChannelOpen(execCh: AgentExecChannel, channel: SSHChannel, command: string): Promise<boolean> {
+  private waitForExecChannelOpen(
+    execCh: AgentExecChannel,
+    channel: SSHChannel,
+    command: string
+  ): Promise<boolean> {
     return new Promise((resolve, reject) => {
       const start = Date.now();
       const timeout = 5000;
@@ -2866,16 +3237,143 @@ export class SSHSession {
       if (this.ws.readyState === WebSocket.OPEN) {
         this.ws.send(JSON.stringify(msg));
       }
-    } catch {}
+    } catch {
+      /* WebSocket 已关闭，无法送达 */
+    }
+  }
+
+  private handleDetachedTerminalOutput(data: Uint8Array, channel: SSHChannel): void {
+    if (this.detachedBufferBytes + data.length <= SSHSession.MAX_DETACHED_BUFFER_BYTES) {
+      this.detachedOutputBuffer.push(data.slice());
+      this.detachedBufferBytes += data.length;
+      this.recordShareTerminalOutput(data);
+      this.queueLocalWindowAdjust(data.length, channel);
+    } else {
+      // 缓冲区达到 128KB：暂停发送 Window Adjust，触发远程进程背压暂停
+      this.unadjustedDetachedBytes += data.length;
+      this.sendDebug('Detached buffer reached 128KB limit; pausing window adjust for backpressure');
+    }
+  }
+
+  public setDetached(detached: boolean): void {
+    if (this.detached === detached) return;
+    this.detached = detached;
+    if (detached && this.config.sessionPolicy?.source === 'share') {
+      void this.writeShareAudit('session.detached', {
+        detachedAt: Date.now(),
+      });
+    }
+  }
+
+  public isDetached(): boolean {
+    return this.detached;
+  }
+
+  public isReady(): boolean {
+    return this.state === 'ready' && !this.closed;
+  }
+
+  /** 分享会话策略（非分享会话返回 null）；供 DO 层在恢复时做过期与绑定校验。 */
+  public getSessionPolicy(): SSHSessionPolicy | null {
+    return this.config.sessionPolicy ?? null;
+  }
+
+  /** 本会话的 SFTP attach URL；断线保持期由 DO 记录并在恢复时回传前端。 */
+  public getSFTPAttachUrl(): string | undefined {
+    return this.sftpAttachUrl;
+  }
+
+  public async reattachWebSocket(
+    newWs: WebSocket,
+    newSize?: TerminalSize | null,
+    credentials?: {
+      resumeToken?: string;
+      sftpAttachUrl?: string;
+      baseline?: { latencyMs: number; colo: string };
+    }
+  ): Promise<void> {
+    this.ws = newWs;
+    this.detached = false;
+
+    // 恢复 SFTP attach URL（若断线期间丢失），保证恢复后可重建 SFTP 数据通道
+    if (credentials?.sftpAttachUrl && !this.sftpAttachUrl) {
+      this.sftpAttachUrl = credentials.sftpAttachUrl;
+    }
+
+    // 1. 下发会话恢复就绪信号（含轮换后的 resume token 与 SFTP attach URL）
+    try {
+      this.ws.send(
+        JSON.stringify({
+          type: 'session_resumed',
+          ...(credentials?.resumeToken ? { resumeToken: credentials.resumeToken } : {}),
+          ...(this.sftpAttachUrl ? { sftpAttachUrl: this.sftpAttachUrl } : {}),
+        })
+      );
+    } catch {
+      /* 新 WebSocket 尚未就绪，忽略 */
+    }
+
+    // 重发双段延迟基线：上游 SSH 连接未重建，原 CF→源站基线仍有效；
+    // 客户端↔CF 段由心跳即时探测补齐
+    if (credentials?.baseline) {
+      try {
+        this.ws.send(
+          JSON.stringify({
+            type: 'rtt',
+            latency: credentials.baseline.latencyMs,
+            colo: credentials.baseline.colo,
+          })
+        );
+      } catch {
+        /* 发送失败忽略 */
+      }
+    }
+
+    // 2. 补发断线期间暂存的输出数据
+    if (this.detachedOutputBuffer.length > 0) {
+      for (const chunk of this.detachedOutputBuffer) {
+        try {
+          this.ws.send(chunk);
+        } catch {
+          /* 发送失败不中断补发流程 */
+        }
+      }
+      this.detachedOutputBuffer = [];
+      this.detachedBufferBytes = 0;
+    }
+
+    // 3. 恢复因背压积压的 Window 额度
+    if (this.unadjustedDetachedBytes > 0 && this.shellChannel) {
+      this.queueLocalWindowAdjust(this.unadjustedDetachedBytes, this.shellChannel);
+      this.unadjustedDetachedBytes = 0;
+    }
+
+    // 4. 同步最新终端视口尺寸
+    if (newSize && this.shellChannel) {
+      await this.handleResize(newSize.cols, newSize.rows).catch(() => null);
+    }
+
+    // 5. 记录分享会话审计
+    if (this.config.sessionPolicy?.source === 'share') {
+      void this.writeShareAudit('session.resumed', {
+        resumedAt: Date.now(),
+      });
+    }
   }
 
   close(normal: boolean = false): void {
     if (this.closed) return;
     this.closed = true;
+    this.detached = false;
+    this.detachedOutputBuffer = [];
+    this.detachedBufferBytes = 0;
+    this.unadjustedDetachedBytes = 0;
     this.notifyShareSessionClosed(normal);
     if (!this.authenticatedSettled) {
       this.authenticatedSettled = true;
-      const error = new Error('SSH session closed before authentication completed') as Error & { normalClose?: boolean };
+      const error = new Error('SSH session closed before authentication completed') as Error & {
+        normalClose?: boolean;
+      };
       error.normalClose = normal;
       this.authenticatedReject(error);
     }
@@ -2889,6 +3387,10 @@ export class SSHSession {
       clearTimeout(this.keepaliveTimeout);
       this.keepaliveTimeout = null;
     }
+    if (this.idleWatchdogInterval) {
+      clearInterval(this.idleWatchdogInterval);
+      this.idleWatchdogInterval = null;
+    }
     if (this.shellReadyTimeout) {
       clearTimeout(this.shellReadyTimeout);
       this.shellReadyTimeout = null;
@@ -2896,6 +3398,10 @@ export class SSHSession {
     if (this.shareSessionExpiryTimer) {
       clearTimeout(this.shareSessionExpiryTimer);
       this.shareSessionExpiryTimer = null;
+    }
+    if (this.shareExpiryWarningTimer) {
+      clearTimeout(this.shareExpiryWarningTimer);
+      this.shareExpiryWarningTimer = null;
     }
     if (this.shareAuditFlushTimer) {
       clearTimeout(this.shareAuditFlushTimer);
@@ -2932,13 +3438,30 @@ export class SSHSession {
     this.channelDataQueue = [];
     this.channelDataQueueHead = 0;
     this.channelDataQueueOffset = 0;
-    try { this.socketWriter?.releaseLock(); } catch (e) { this.sendDebug(() => `Release socket writer lock: ${e instanceof Error ? e.message : e}`); }
+    this.channelDataQueueBytes = 0;
+    try {
+      this.socketWriter?.releaseLock();
+    } catch (e) {
+      this.sendDebug(() => `Release socket writer lock: ${e instanceof Error ? e.message : e}`);
+    }
     this.socketWriter = null;
-    try { this.socket.close(); } catch (e) { this.sendDebug(() => `Close TCP socket: ${e instanceof Error ? e.message : e}`); }
-    try { this.sftpWs?.close(normal ? 1000 : 1011); } catch (e) { this.sendDebug(() => `Close SFTP ws: ${e instanceof Error ? e.message : e}`); }
+    try {
+      this.socket.close();
+    } catch (e) {
+      this.sendDebug(() => `Close TCP socket: ${e instanceof Error ? e.message : e}`);
+    }
+    try {
+      this.sftpWs?.close(normal ? 1000 : 1011);
+    } catch (e) {
+      this.sendDebug(() => `Close SFTP ws: ${e instanceof Error ? e.message : e}`);
+    }
     this.sftpWs = null;
     if (this.ownsWebSocket) {
-      try { this.ws.close(normal ? 1000 : 1011); } catch (e) { this.sendDebug(() => `Close SSH ws: ${e instanceof Error ? e.message : e}`); }
+      try {
+        this.ws.close(normal ? 1000 : 1011);
+      } catch (e) {
+        this.sendDebug(() => `Close SSH ws: ${e instanceof Error ? e.message : e}`);
+      }
     }
   }
 }
