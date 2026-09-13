@@ -90,6 +90,23 @@ function getTabManager(): TabManager {
     tabManager.setTabsChangedHandler(() => {
       syncConnectionBackButtons();
     });
+    // 右键标签页克隆会话
+    tabManager.setDuplicateTabHandler(async (tab) => {
+      const serverId = tab.hostInfo?.serverId;
+      if (!serverId) {
+        notify(t('terminal.duplicateAnonymousUnsupported'), { variant: 'warning' });
+        return;
+      }
+      try {
+        const ws = await requestSavedServerWebSocket(serverId);
+        const { terminal } = showTerminalWithNewTab(tab.label, tab.hostInfo);
+        terminal.mount();
+        const reconnectFactory = () => requestSavedServerWebSocket(serverId);
+        terminal.connectWithWebSocket(ws, tab.hostInfo, { reconnectFactory });
+      } catch (e) {
+        notify(e instanceof Error ? e.message : String(e), { variant: 'danger' });
+      }
+    });
 
     // 绑定 new-tab-btn
     bindNewTabButton();
@@ -178,7 +195,7 @@ function initTerminalTab(): void {
   const wsUrl = params.get('wsUrl')!;
   const serverName = params.get('name') || 'Server';
   const host = params.get('host') || '';
-  const port = parseInt(params.get('port') || '0') || 0;
+  const port = parseInt(params.get('port') || '0', 10) || 0;
 
   if (!validateWsUrl(wsUrl)) {
     const errorDiv = document.createElement('div');
@@ -409,12 +426,12 @@ document.getElementById('disconnect-btn')?.addEventListener('click', () => {
 
 // ==================== 命令片段库 ====================
 
-function openSnippetManager(): void {
-  void snippetManager.open();
+function toggleSnippetManager(): void {
+  snippetManager.toggle();
 }
 
-document.getElementById('snippet-toggle-btn')?.addEventListener('click', openSnippetManager);
-document.getElementById('mobile-snippets-btn')?.addEventListener('click', openSnippetManager);
+document.getElementById('snippet-toggle-btn')?.addEventListener('click', toggleSnippetManager);
+document.getElementById('mobile-snippets-btn')?.addEventListener('click', toggleSnippetManager);
 
 // ==================== SFTP 面板 ====================
 
